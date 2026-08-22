@@ -37,3 +37,65 @@ export PATH="$HOME/.local/bin:$PATH"
 5. **Run:** `cloudsync run <job|all>`
 
 `cloudsync help` lists every command.
+
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `setup` | rclone + `~/.local/bin` + seed config |
+| `dry <job\|all>` | preview, no writes |
+| `run <job\|all> [--force]` | real run (`--force` skips the safety gate) |
+| `resync <job>` | first-time bisync baseline |
+| `status` / `verify` / `logs` / `doctor` | inspect last run, destination, logs, FDA |
+| `edit` | job map in `$EDITOR` |
+| `list [jobs\|backups\|icloud-apps]` | job map, destination snapshots, iCloud containers |
+| `schedule install …` | launchd (`hourly`, `daily HH:MM`, or interval seconds) |
+| `clean logs` / `clean backups` | prune local logs or destination backup snapshots |
+
+Bare `cloudsync` opens an interactive menu if [fzf](https://github.com/junegunn/fzf) is installed; otherwise it prints the job list. fzf is optional.
+
+## Job map
+
+`~/.config/cloudsync/jobs.tsv` — **one TAB between columns**, not spaces:
+
+```
+name<TAB>mode<TAB>source<TAB>dest<TAB>[extra rclone flags]
+```
+
+| mode | Behaviour |
+| --- | --- |
+| `copy` | add/update only; never deletes on dest |
+| `sync` | dest mirrors source; deleted/overwritten files go to `.cloudsync-backups/` |
+| `bisync` | two-way; run `cloudsync resync <name>` once before the first `run` |
+
+Paths:
+
+- `iCloudDocs/…` — iCloud Drive files (`com~apple~CloudDocs` only)
+- `iCloudAll/…` — whole `Mobile Documents` tree (Finder's merged iCloud Drive)
+- `Remote:path` — rclone remote
+- `~/…` or `/abs` — local
+
+In extra flags, `@prefetch` runs `brctl download` so dataless iCloud files become real bytes. A leading `~/` on a flag argument is expanded (rclone will not). See `examples/jobs.tsv` and `examples/icloud.filter`.
+
+## Safety
+
+On real `sync` / `bisync` runs, cloudsync aborts if a side lists 0 files (empty or unreadable — the usual Full Disk Access miss), or if a `sync` would delete more than `MAX_DELETE` files (default 50). Override with `cloudsync run <job> --force`.
+
+Sync backups on the destination are **not** auto-pruned (`cloudsync clean backups`). Per-run logs are pruned after each run unless `AUTO_CLEAN=0` in the config file.
+
+## Files
+
+| What | Where |
+| --- | --- |
+| Job map | `~/.config/cloudsync/jobs.tsv` |
+| Optional overrides | `~/.config/cloudsync/config` (sourced as bash) |
+| Logs | `~/Library/Logs/cloudsync/` |
+| State / locks | `~/.local/state/cloudsync/` |
+| Sync backups | `<dest>/.cloudsync-backups/<job>/<timestamp>/` |
+
+Scheduled runs use a LaunchAgent whose PATH includes `~/.local/bin`, so they find the rclone that `setup` installed. Terminal often already has Full Disk Access; launchd does not inherit it — grant FDA to **rclone**, then `cloudsync schedule kick` and `cloudsync status` to confirm.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
