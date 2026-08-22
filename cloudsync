@@ -1,0 +1,846 @@
+#!/usr/bin/env bash
+#
+# cloudsync — drive rclone syncs between iCloud, NextCloud, Filen (and OneDrive)
+# from a simple per-job map. See: cloudsync help
+#
+# Written for stock macOS bash 3.2 — no bash4-isms.
+
+set -u
+set -o pipefail
+
+# ---------------------------------------------------------------------------
+# Locate the project dir = the directory of this script, resolved through any
+# symlink (e.g. ~/bin/cloudsync -> ~/project/ralfssync/cloudsync). Used for the
+# scheduled (launchd) program path. The script itself lives in the project;
+# config/logs/state follow OS conventions (see below).
+# ---------------------------------------------------------------------------
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
+  _src="$(readlink "$_src")"; case "$_src" in /*) ;; *) _src="$_dir/$_src" ;; esac
+done
+PROJECT_DIR="$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)"
+
+# ---------------------------------------------------------------------------
+# Paths & defaults — standard OS locations (override via CLOUDSYNC_* env).
+#   config : $XDG_CONFIG_HOME/cloudsync   (~/.config/cloudsync)
+#   state  : $XDG_STATE_HOME/cloudsync    (~/.local/state/cloudsync)
+#   logs   : ~/Library/Logs/cloudsync     (macOS convention)
+# ---------------------------------------------------------------------------
+CONFIG_DIR="${CLOUDSYNC_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cloudsync}"
+JOBS_FILE="$CONFIG_DIR/jobs.tsv"
+CONFIG_FILE="$CONFIG_DIR/config"
+LOG_DIR="${CLOUDSYNC_LOG_DIR:-$HOME/Library/Logs/cloudsync}"
+STATE_DIR="${CLOUDSYNC_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cloudsync}"
+LOCK_DIR="$STATE_DIR/locks"
+
+# iCloud lives under "Mobile Documents". com~apple~CloudDocs is just the loose
+# "iCloud Drive" files; each app keeps its own sibling container next to it.
+# 'iCloudDocs' -> only the Drive files (com~apple~CloudDocs)
+# 'iCloudAll'  -> the whole tree incl. every app container (what Finder merges)
+ICLOUD_MOBILE="$HOME/Library/Mobile Documents"
+ICLOUD_ROOT="$ICLOUD_MOBILE/com~apple~CloudDocs"
+
+# rclone tuning / safety defaults
+TRANSFERS=6
+CHECKERS=12
+MAX_DELETE=50           # sync/bisync abort if a run would delete more than this many files
+BACKUP_ROOT_NAME=".cloudsync-backups"
+LAUNCHD_LABEL="com.user.cloudsync"
+FORCE=0                 # set by 'run --force' to bypass the pre-flight safety gate
+
+# Log/state retention (override in $CONFIG_FILE)
+AUTO_CLEAN=1               # prune logs automatically after each run/dry
+LOG_RETENTION_DAYS=30     # delete per-run logs older than this many days
+LAUNCHD_LOG_MAX_LINES=2000 # cap the appended launchd.out/err logs to this many lines
+LOCK_STALE_HOURS=12       # remove orphaned lock dirs older than this (crashed runs)
+BACKUP_RETENTION_DAYS=90  # default age cutoff for 'backups clean' (sync backup-dir snapshots)
+NOTIFY=auto               # macOS notification on failure/abort: auto (non-interactive only) | always | never
+
+# Load user overrides if present
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$STATE_DIR" "$LOCK_DIR" 2>/dev/null
+
+TS() { date +%Y%m%d-%H%M%S; }
+err() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+info() { printf '\033[36m%s\033[0m\n' "$*" >&2; }
+ok()  { printf '\033[32m%s\033[0m\n' "$*" >&2; }
+
+# Lock held by the job currently running, so a signal handler can release it.
+CURRENT_LOCK=""
+_release_lock() { [ -n "${1:-}" ] && rm -rf "$1" 2>/dev/null; }
+_on_signal() {
+  trap - INT TERM HUP
+  if [ -n "$CURRENT_LOCK" ]; then _release_lock "$CURRENT_LOCK"; CURRENT_LOCK=""; err "interrupted — released lock"; fi
+  exit 130
+}
+trap _on_signal INT TERM HUP
+
+# Human-friendly "N ago" from an epoch timestamp.
+_ago() {
+  local s=$(( $(date +%s) - ${1:-0} ))
+  if   [ "$s" -lt 60 ];    then echo "${s}s ago"
+  elif [ "$s" -lt 3600 ];  then echo "$((s/60))m ago"
+  elif [ "$s" -lt 86400 ]; then echo "$((s/3600))h ago"
+  else echo "$((s/86400))d ago"; fi
+}
+
+# Record a job's last-run outcome:  name rc duration(s) outcome detail
+record_status() {
+  mkdir -p "$STATE_DIR/status" 2>/dev/null
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$2" "$3" "$4" "$5" > "$STATE_DIR/status/$1"
+}
+
+# Post a macOS notification (failures/aborts). Honors $NOTIFY: never|always|auto.
+# 'auto' notifies only for non-interactive runs (launchd), where you'd miss the output.
+notify() {
+  [ "$NOTIFY" = never ] && return 0
+  [ "$NOTIFY" = always ] || [ ! -t 1 ] || return 0
+  local title="$1" msg="$2"
+  title="${title//\"/}"; msg="${msg//\"/}"
+  osascript -e "display notification \"$msg\" with title \"$title\"" >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Path resolution
+#   iCloudDocs[/Sub]  -> iCloud Drive files (com~apple~CloudDocs)
+#   iCloudAll[/Sub]   -> whole Mobile Documents tree (all app containers)
+#   Remote:path       -> left as-is
+#   ~/x, /abs         -> expanded local path
+# ---------------------------------------------------------------------------
+resolve_path() {
+  case "$1" in
+    iCloudAll)    printf '%s' "$ICLOUD_MOBILE" ;;
+    iCloudAll/*)  printf '%s/%s' "$ICLOUD_MOBILE" "${1#iCloudAll/}" ;;
+    iCloudDocs)   printf '%s' "$ICLOUD_ROOT" ;;
+    iCloudDocs/*) printf '%s/%s' "$ICLOUD_ROOT" "${1#iCloudDocs/}" ;;
+    "~/"*)       printf '%s/%s' "$HOME" "${1#~/}" ;;
+    *)           printf '%s' "$1" ;;
+  esac
+}
+
+# Is this resolved token an rclone remote (has "name:" before any slash)?
+is_remote() {
+  case "$1" in
+    /*|~*) return 1 ;;                 # absolute local path
+    *:*)
+      # remote if the part before first ':' contains no '/'
+      case "${1%%:*}" in */*) return 1 ;; *) return 0 ;; esac ;;
+    *) return 1 ;;
+  esac
+}
+
+# Compute a backup-dir for sync mode (kept copies of overwritten/deleted files)
+# Where backups for a given dest live (a remote-root or local-home folder).
+backup_base_for_dest() {
+  local dest="$1"
+  if is_remote "$dest"; then printf '%s:%s' "${dest%%:*}" "$BACKUP_ROOT_NAME"
+  else printf '%s/%s' "$HOME" "$BACKUP_ROOT_NAME"; fi
+}
+
+backup_dir_for() {
+  # $1 = job name, $2 = resolved dest
+  printf '%s/%s/%s' "$(backup_base_for_dest "$2")" "$1" "$(TS)"
+}
+
+# brctl-download any local iCloud paths so rclone sees real bytes, not stubs
+prefetch_icloud() {
+  local p
+  for p in "$@"; do
+    case "$p" in
+      "$ICLOUD_MOBILE"*)
+        info "  prefetch: materializing dataless files under $p"
+        brctl download "$p" 2>/dev/null || true ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Job map parsing
+# Format (tab-separated):  name <TAB> mode <TAB> source <TAB> dest <TAB> [extra]
+#   mode  = copy | sync | bisync
+#   extra = optional rclone flags; may include the pseudo-token @prefetch
+# Lines starting with # and blank lines are ignored.
+# ---------------------------------------------------------------------------
+job_names() {
+  [ -f "$JOBS_FILE" ] || return 0
+  while IFS=$'\t' read -r name mode src dst extra; do
+    case "$name" in ''|\#*) continue ;; esac
+    printf '%s\n' "$name"
+  done < "$JOBS_FILE"
+}
+
+# Look up one job; sets globals J_NAME J_MODE J_SRC J_DST J_EXTRA. Returns 1 if absent.
+load_job() {
+  local want="$1"
+  [ -f "$JOBS_FILE" ] || { err "No job map: $JOBS_FILE"; return 1; }
+  while IFS=$'\t' read -r name mode src dst extra; do
+    case "$name" in ''|\#*) continue ;; esac
+    if [ "$name" = "$want" ]; then
+      J_NAME="$name"; J_MODE="$mode"; J_SRC="$src"; J_DST="$dst"; J_EXTRA="$extra"
+      return 0
+    fi
+  done < "$JOBS_FILE"
+  err "Unknown job: $want"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Pre-flight safety gate (sync/bisync, real runs only)
+# ---------------------------------------------------------------------------
+# Count files rclone can actually see at a path (0 => empty OR unreadable).
+count_objects() {
+  rclone size "$1" "${@:2}" 2>/dev/null | grep 'Total objects' | grep -oE '[0-9]+' | head -1
+}
+
+# Refuse if a path lists 0 files — the classic "source came back empty because
+# the runner lacks Full Disk Access" trap that makes sync wipe the other side.
+preflight_empty() {
+  local name="$1" path="$2"; shift 2
+  local n; n="$(count_objects "$path" "$@")"; n="${n:-0}"
+  if [ "$n" -eq 0 ]; then
+    err "[$name] ABORT: '$path' lists 0 files (empty or unreadable)."
+    err "          Refusing — a mirror from here could DELETE the other side."
+    err "          If this is local/iCloud, the runner probably lacks Full Disk Access."
+    err "          To override deliberately: cloudsync run $name --force"
+    return 1
+  fi
+  return 0
+}
+
+# Full gate for 'sync': source-not-empty + count how many files this run would
+# delete on the destination, and stop (before touching anything) if it's too many.
+preflight_guard() {
+  local name="$1" src="$2" dst="$3"; shift 3
+  local -a xa=("$@")
+  info "[$name] pre-flight: checking source size and deletion impact…"
+  preflight_empty "$name" "$src" "${xa[@]}" || return 1
+  local dlog="$STATE_DIR/preflight-$name.log" ndel
+  rclone sync "$src" "$dst" --dry-run "${xa[@]}" >"$dlog" 2>&1 || true
+  ndel="$(grep 'Deleted:' "$dlog" | tail -1 | grep -oE '[0-9]+' | head -1)"; ndel="${ndel:-0}"
+  if [ "$ndel" -gt "$MAX_DELETE" ]; then
+    err "[$name] ABORT: this run would delete $ndel file(s) on the destination (limit $MAX_DELETE)."
+    err "          Deletion preview: $dlog"
+    err "          If that is intended, run: cloudsync run $name --force"
+    return 1
+  fi
+  ok "[$name] pre-flight OK: source not empty; $ndel deletion(s) ≤ limit $MAX_DELETE."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Run a single job.  $1=name  $2=dryrun(0/1)  $3=resync(0/1, bisync only)
+# ---------------------------------------------------------------------------
+# Lock wrapper around _do_job so a scheduled run can't collide with a manual one.
+run_job() {
+  local name="$1" dry="${2:-0}" resync="${3:-0}"
+  local lock="$LOCK_DIR/$name.lock"
+  if ! mkdir "$lock" 2>/dev/null; then
+    # Lock exists — is the owning process still alive? If not, it's stale
+    # (e.g. a previous run was kill -9'd or the machine lost power); steal it.
+    local opid; opid="$(cat "$lock/pid" 2>/dev/null)"
+    if [ -n "$opid" ] && kill -0 "$opid" 2>/dev/null; then
+      err "[$name] already running (pid $opid, lock: $lock) — skipping"
+      return 1
+    fi
+    info "[$name] clearing stale lock (owner ${opid:-unknown} not running)"
+    rm -rf "$lock"
+    mkdir "$lock" 2>/dev/null || { err "[$name] cannot acquire lock $lock"; return 1; }
+  fi
+  printf '%s\n' "$$" > "$lock/pid"
+  CURRENT_LOCK="$lock"
+  _do_job "$name" "$dry" "$resync"
+  local rc=$?
+  _release_lock "$lock"; CURRENT_LOCK=""
+  return $rc
+}
+
+_do_job() {
+  local name="$1" dry="${2:-0}" resync="${3:-0}"
+  local start=$SECONDS
+  load_job "$name" || return 1
+
+  local src dst
+  src="$(resolve_path "$J_SRC")"
+  dst="$(resolve_path "$J_DST")"
+
+  # Pull @prefetch out of the extra flags
+  local extra="$J_EXTRA" do_prefetch=0
+  case " $extra " in *" @prefetch "*) do_prefetch=1; extra="${extra//@prefetch/}" ;; esac
+
+  local log="$LOG_DIR/$name-$(TS).log"
+
+  # Interactive => live progress; non-tty (launchd) => periodic full stats blocks.
+  # (Full stats, not --stats-one-line, so the log carries labeled Transferred:/
+  #  Errors:/Deleted: lines that 'status' and the failure summary parse.)
+  local ui_flags
+  if [ -t 1 ]; then ui_flags="--progress"
+  else ui_flags="--stats=1m"; fi
+
+  # split extra flags into argv safely
+  local -a extra_args=()
+  # shellcheck disable=SC2086
+  read -r -a extra_args <<< "$extra"
+  # Expand a leading ~/ in flag args (e.g. --filter-from ~/.config/...), since
+  # these reach rclone as raw argv and neither rclone nor a shell expands them.
+  if [ "${#extra_args[@]}" -gt 0 ]; then
+    local _i
+    for _i in "${!extra_args[@]}"; do
+      case "${extra_args[$_i]}" in "~/"*) extra_args[$_i]="$HOME/${extra_args[$_i]#\~/}" ;; esac
+    done
+  fi
+
+  local -a common=(--transfers "$TRANSFERS" --checkers "$CHECKERS" \
+                   --log-file "$log" --log-level INFO $ui_flags)
+  [ "$dry" = 1 ] && common+=(--dry-run)
+
+  [ "$do_prefetch" = 1 ] && prefetch_icloud "$src" "$dst"
+
+  # Safety gate: on real (non-dry) runs, never let a mirror silently delete a lot,
+  # or wipe a side because the other came back empty/unreadable. --force bypasses.
+  if [ "$dry" = 0 ] && [ "$FORCE" = 0 ]; then
+    local _abort=""
+    case "$J_MODE" in
+      sync)   preflight_guard "$name" "$src" "$dst" --exclude "/$BACKUP_ROOT_NAME/**" "${extra_args[@]}" || _abort=1 ;;
+      bisync) preflight_empty "$name" "$src" "${extra_args[@]}" && \
+              preflight_empty "$name" "$dst" "${extra_args[@]}" || _abort=1 ;;
+    esac
+    if [ -n "$_abort" ]; then
+      record_status "$name" 1 $((SECONDS-start)) aborted "pre-flight safety gate"
+      notify "cloudsync: $name ABORTED" "pre-flight safety gate blocked the run"
+      return 1
+    fi
+  fi
+
+  info "[$name] mode=$J_MODE  dry=$dry  $src  ->  $dst"
+  info "       log: $log"
+
+  local -a cmd
+  case "$J_MODE" in
+    copy)
+      cmd=(rclone copy "$src" "$dst" "${common[@]}" "${extra_args[@]}")
+      ;;
+    sync)
+      # Keep overwritten/deleted files in a backup dir, and exclude that dir from
+      # the transfer so it never overlaps the destination (fatal for remote-root
+      # dests like 'Filen:') and is never re-synced/deleted between clouds.
+      local bk; bk="$(backup_dir_for "$name" "$dst")"
+      cmd=(rclone sync "$src" "$dst" --backup-dir "$bk" \
+           --exclude "/$BACKUP_ROOT_NAME/**" \
+           --max-delete "$MAX_DELETE" "${common[@]}" "${extra_args[@]}")
+      ;;
+    bisync)
+      cmd=(rclone bisync "$src" "$dst" --resilient --recover \
+           --conflict-resolve newer --conflict-loser pathname \
+           --max-delete "$MAX_DELETE" "${common[@]}" "${extra_args[@]}")
+      [ "$resync" = 1 ] && cmd+=(--resync)
+      ;;
+    *)
+      err "[$name] unknown mode '$J_MODE' (use copy|sync|bisync)"
+      return 1
+      ;;
+  esac
+
+  "${cmd[@]}"
+  local rc=$?
+
+  # Distil a one-line summary from rclone's log (bytes / deletions / errors).
+  local detail="" xfer del errs
+  if [ -f "$log" ]; then
+    xfer="$(grep -aE 'Transferred:.*B / ' "$log" | tail -1 | sed -E 's/.*Transferred:[[:space:]]*//; s/,.*//')"
+    del="$(grep -a 'Deleted:' "$log" | tail -1 | grep -oE '[0-9]+' | head -1)"
+    errs="$(grep -a 'Errors:' "$log" | tail -1 | grep -oE '[0-9]+' | head -1)"
+    detail="${xfer:-0 B}"
+    [ -n "$del" ]  && [ "$del" != 0 ]  && detail="$detail, ${del} deleted"
+    [ -n "$errs" ] && [ "$errs" != 0 ] && detail="$detail, ${errs} errors"
+  fi
+
+  local outcome; [ $rc -eq 0 ] && outcome=ok || outcome=failed
+  [ "$dry" = 0 ] && record_status "$name" "$rc" $((SECONDS-start)) "$outcome" "$detail"
+  if [ $rc -eq 0 ]; then
+    ok "[$name] done (rc=0) — $detail"
+  else
+    err "[$name] FAILED rc=$rc (see $log)"
+    [ "$dry" = 0 ] && notify "cloudsync: $name FAILED" "rc=$rc — ${detail:-see log}"
+  fi
+  return $rc
+}
+
+run_set() {
+  # $1 = job name or 'all'  ; $2 = dryrun(0/1)
+  local target="$1" dry="$2" rc=0 n
+  if [ "$target" = all ]; then
+    for n in $(job_names); do run_job "$n" "$dry" 0 || rc=1; done
+  else
+    run_job "$target" "$dry" 0 || rc=1
+  fi
+  [ "$AUTO_CLEAN" = 1 ] && prune_state "$LOG_RETENTION_DAYS" 0
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
+# Pretty listing
+# ---------------------------------------------------------------------------
+list_jobs() {
+  [ -f "$JOBS_FILE" ] || { err "No job map yet: $JOBS_FILE"; return 1; }
+  printf '%-16s %-7s %s\n' NAME MODE 'SOURCE  ->  DEST'
+  printf '%-16s %-7s %s\n' ---------------- ------- ------------------------------
+  while IFS=$'\t' read -r name mode src dst extra; do
+    case "$name" in ''|\#*) continue ;; esac
+    printf '%-16s %-7s %s  ->  %s\n' "$name" "$mode" "$src" "$dst"
+  done < "$JOBS_FILE"
+}
+
+# Router for read-only listings:  list [jobs|backups|icloud-apps]  (default jobs)
+cmd_list() {
+  local what="${1:-jobs}"
+  case "$what" in
+    jobs)        list_jobs ;;
+    backups)     backups_list ;;
+    icloud-apps) cmd_icloud_apps ;;
+    *) err "list <jobs|backups|icloud-apps>"; return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# fzf menu
+# ---------------------------------------------------------------------------
+cmd_menu() {
+  command -v fzf >/dev/null 2>&1 || { err "fzf not installed (brew install fzf)"; return 1; }
+  local rows sel name action
+  rows="$( { printf 'all\tALL\trun every job\n'; \
+             while IFS=$'\t' read -r name mode src dst extra; do
+               case "$name" in ''|\#*) continue ;; esac
+               printf '%s\t%s\t%s -> %s\n' "$name" "$mode" "$src" "$dst"
+             done < "$JOBS_FILE"; } )"
+  sel="$(printf '%s\n' "$rows" | fzf --with-nth=1,2,3 --delimiter='\t' \
+         --header='Pick a sync job (ESC to cancel)' --height=40% --reverse)" || return 0
+  name="$(printf '%s' "$sel" | cut -f1)"
+  [ -n "$name" ] || return 0
+  action="$(printf 'Dry run (safe preview)\nRun for real\nResync (bisync baseline)\n' \
+            | fzf --header="Action for: $name" --height=20% --reverse)" || return 0
+  case "$action" in
+    Dry*)    run_set "$name" 1 ;;
+    Run*)    run_set "$name" 0 ;;
+    Resync*) [ "$name" = all ] && { err "resync one bisync job at a time"; return 1; }
+             run_job "$name" 0 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# launchd scheduling
+# ---------------------------------------------------------------------------
+plist_path() { printf '%s/Library/LaunchAgents/%s.plist' "$HOME" "$LAUNCHD_LABEL"; }
+
+cmd_schedule() {
+  local sub="${1:-status}" arg="${2:-manual}" time="${3:-03:00}"
+  local plist; plist="$(plist_path)"
+  local uid; uid="$(id -u)"
+  case "$sub" in
+    install)
+      # Build the trigger block based on the chosen cadence.
+      local trigger="" desc=""
+      case "$arg" in
+        manual|disabled|none)
+          trigger=""; desc="manual only — run with: launchctl kickstart gui/$uid/$LAUNCHD_LABEL" ;;
+        hourly)
+          trigger="  <key>StartInterval</key><integer>3600</integer>"; desc="every hour" ;;
+        daily)
+          local h="${time%%:*}" m="${time##*:}"; h="${h#0}"; m="${m#0}"
+          trigger="  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>${h:-0}</integer><key>Minute</key><integer>${m:-0}</integer></dict>"
+          desc="daily at $time" ;;
+        *[!0-9]*)
+          err "schedule install: bad cadence '$arg' (manual | hourly | daily [HH:MM] | <seconds>)"; return 1 ;;
+        *)
+          trigger="  <key>StartInterval</key><integer>$arg</integer>"; desc="every ${arg}s" ;;
+      esac
+      mkdir -p "$HOME/Library/LaunchAgents"
+      cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>            <string>$LAUNCHD_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$PROJECT_DIR/cloudsync</string>
+    <string>run</string>
+    <string>all</string>
+  </array>
+$trigger
+  <key>RunAtLoad</key>        <false/>
+  <key>StandardOutPath</key>  <string>$LOG_DIR/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>$LOG_DIR/launchd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+</dict>
+</plist>
+PLIST
+      launchctl bootout "gui/$uid/$LAUNCHD_LABEL" 2>/dev/null
+      launchctl bootstrap "gui/$uid" "$plist" && ok "Installed ($LAUNCHD_LABEL): 'cloudsync run all' — $desc"
+      info "plist: $plist"
+      ;;
+    kick|run-now)
+      launchctl kickstart -k "gui/$uid/$LAUNCHD_LABEL" && ok "Kicked off a run via launchd. Watch: cloudsync logs"
+      ;;
+    uninstall)
+      launchctl bootout "gui/$uid/$LAUNCHD_LABEL" 2>/dev/null
+      rm -f "$plist" && ok "Schedule removed."
+      ;;
+    status)
+      if launchctl print "gui/$uid/$LAUNCHD_LABEL" >/dev/null 2>&1; then
+        ok "Schedule loaded ($LAUNCHD_LABEL)"
+        launchctl print "gui/$uid/$LAUNCHD_LABEL" | grep -iE 'state|runs|interval|calendar' || true
+      else
+        info "Not loaded. Install with: cloudsync schedule install [manual|hourly|daily [HH:MM]|<seconds>]"
+      fi
+      ;;
+    *) err "schedule: install [manual|hourly|daily [HH:MM]|<seconds>] | kick | uninstall | status" ; return 1 ;;
+  esac
+}
+
+cmd_logs() {
+  local latest; latest="$(ls -t "$LOG_DIR"/*.log 2>/dev/null | head -1)"
+  [ -n "$latest" ] || { info "No logs yet in $LOG_DIR"; return 0; }
+  info "Tailing $latest (Ctrl-C to stop)"; tail -f "$latest"
+}
+
+# Read-only health probe. The iCloud check is the important one: it must pass in
+# the SAME context that will run the sync (e.g. launchd), which needs Full Disk
+# Access. Run via 'schedule kick' against a probe to test the launchd context.
+cmd_doctor() {
+  info "cloudsync doctor"
+  printf '  rclone : %s\n' "$(command -v rclone || echo MISSING)"
+  printf '  iCloud : %s\n' "$ICLOUD_ROOT"
+  local out
+  out="$(rclone lsf --dirs-only "$ICLOUD_ROOT" 2>&1)"
+  if printf '%s' "$out" | grep -qiE 'permission denied|operation not permitted|not permitted|error'; then
+    err "         NOT readable here — $(printf '%s' "$out" | head -1)"
+    err "         => this context lacks Full Disk Access (fine for Terminal; required for launchd)."
+  else
+    ok "         readable ($(printf '%s\n' "$out" | grep -c .) top-level folders)"
+  fi
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    if rclone lsd "$r" --max-depth 1 >/dev/null 2>&1; then ok "  remote  $r reachable"
+    else err "  remote  $r NOT reachable"; fi
+  done < <(rclone listremotes 2>/dev/null)
+}
+
+# List the iCloud containers under "Mobile Documents" so you can see everything
+# Finder merges into "iCloud Drive" (com~apple~CloudDocs + each app's Documents).
+cmd_icloud_apps() {
+  info "iCloud containers under: $ICLOUD_MOBILE"
+  info "(folder on disk  ->  items in its Documents)"
+  local name docs n
+  while IFS= read -r name; do
+    name="${name%/}"; [ -n "$name" ] || continue
+    docs="$ICLOUD_MOBILE/$name/Documents"
+    if rclone lsf "$docs" >/dev/null 2>&1; then
+      n="$(rclone lsf "$docs" 2>/dev/null | grep -c .)"
+    else n="(no Documents folder)"; fi
+    printf '  %-44s %s\n' "$name" "$n"
+  done < <(rclone lsf --dirs-only "$ICLOUD_MOBILE" 2>/dev/null)
+}
+
+# Last-run health for every job in the map (from $STATE_DIR/status/<job>).
+cmd_status() {
+  local sdir="$STATE_DIR/status" name epoch rc dur outcome detail c word
+  printf '%-16s %-8s %-10s %-7s %s\n' JOB RESULT WHEN AGO DETAIL
+  printf '%-16s %-8s %-10s %-7s %s\n' ---------------- -------- ---------- ------- ------
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if [ -f "$sdir/$name" ]; then
+      IFS=$'\t' read -r epoch rc dur outcome detail < "$sdir/$name"
+      case "$outcome" in ok) c=32; word=OK ;; aborted) c=33; word=ABORTED ;; *) c=31; word=FAILED ;; esac
+      printf '%-16s \033[%sm%-8s\033[0m %-10s %-7s %s\n' \
+        "$name" "$c" "$word" "$(_ago "$epoch")" "${dur}s" "${detail:-}"
+    else
+      printf '%-16s \033[90m%-8s\033[0m %-10s %-7s %s\n' "$name" "never" "-" "-" "(not run yet)"
+    fi
+  done < <(job_names)
+}
+
+# Verify a backup: does the destination contain every source file, matching?
+# Default compares sizes (fast, no iCloud downloads); --deep compares hashes.
+verify_job() {
+  local name="$1" deep="${2:-0}"
+  load_job "$name" || return 1
+  local src dst; src="$(resolve_path "$J_SRC")"; dst="$(resolve_path "$J_DST")"
+  local extra="${J_EXTRA//@prefetch/}"
+  local -a xa=(); read -r -a xa <<< "$extra"
+  if [ "${#xa[@]}" -gt 0 ]; then
+    local _i; for _i in "${!xa[@]}"; do case "${xa[$_i]}" in "~/"*) xa[$_i]="$HOME/${xa[$_i]#\~/}" ;; esac; done
+  fi
+  [ "$J_MODE" = sync ] && xa+=(--exclude "/$BACKUP_ROOT_NAME/**")
+  local log="$LOG_DIR/verify-$name-$(TS).log"
+  local -a cmp=(--one-way --log-file "$log" --log-level NOTICE)
+  local how="sizes"; if [ "$deep" = 1 ]; then how="hashes"; else cmp+=(--size-only); fi
+  info "[$name] verify ($how, one-way): $src  vs  $dst"
+  rclone check "$src" "$dst" "${cmp[@]}" "${xa[@]}"
+  local rc=$?
+  if [ $rc -eq 0 ]; then ok "[$name] verify OK — destination has every source file (matching $how)"
+  else err "[$name] verify: differences found (rc=$rc) — see $log"; fi
+  return $rc
+}
+
+cmd_verify() {
+  local deep=0 target="" a
+  for a in "$@"; do
+    case "$a" in
+      --deep) deep=1 ;;
+      -*) err "verify: unknown flag '$a' (use --deep)"; return 1 ;;
+      *) target="$a" ;;
+    esac
+  done
+  [ -n "$target" ] || { err "verify <job|all> [--deep]"; return 1; }
+  if [ "$target" = all ]; then
+    local rc=0 n; for n in $(job_names); do verify_job "$n" "$deep" || rc=1; done; return $rc
+  fi
+  verify_job "$target" "$deep"
+}
+
+# ---------------------------------------------------------------------------
+# Log/state housekeeping
+#   - delete per-run logs older than $days
+#   - cap the append-only launchd.out/err logs to the last N lines
+#   - remove orphaned lock dirs left by a crashed run
+# $1=days  $2=dry(0/1).  Silent in non-dry mode (safe to call automatically).
+# ---------------------------------------------------------------------------
+prune_state() {
+  local days="${1:-$LOG_RETENTION_DAYS}" dry="${2:-0}" n=0 f d lines
+  # 1) old per-run logs (keep the appended launchd.*.log — handled separately)
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ "$dry" = 1 ]; then printf '  rm   %s\n' "$f" >&2; else rm -f "$f"; fi
+    n=$((n+1))
+  done < <(find "$LOG_DIR" -type f -name '*.log' ! -name 'launchd.*.log' -mtime +"$days" 2>/dev/null)
+  # 2) cap the launchd append logs
+  for f in "$LOG_DIR"/launchd.out.log "$LOG_DIR"/launchd.err.log; do
+    [ -f "$f" ] || continue
+    lines="$(wc -l < "$f" 2>/dev/null | tr -d ' ')"; lines="${lines:-0}"
+    if [ "$lines" -gt "$LAUNCHD_LOG_MAX_LINES" ]; then
+      if [ "$dry" = 1 ]; then printf '  trim %s (%s -> %s lines)\n' "$f" "$lines" "$LAUNCHD_LOG_MAX_LINES" >&2
+      else tail -n "$LAUNCHD_LOG_MAX_LINES" "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"; fi
+    fi
+  done
+  # 3) orphaned locks from crashed runs
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    if [ "$dry" = 1 ]; then printf '  unlock %s\n' "$d" >&2; else rm -rf "$d" 2>/dev/null; fi
+  done < <(find "$LOCK_DIR" -mindepth 1 -type d -mmin +$((LOCK_STALE_HOURS*60)) 2>/dev/null)
+  [ "$dry" = 1 ] && info "(dry-run) $n run-log(s) would be removed"
+  return 0
+}
+
+# Router for pruning:  clean [logs|backups] [options]  (default logs)
+cmd_clean() {
+  case "${1:-logs}" in
+    logs)    shift 2>/dev/null || true; clean_logs "$@" ;;
+    backups) shift; backups_clean "$@" ;;
+    -*)      clean_logs "$@" ;;   # back-compat: `clean --days N` == `clean logs ...`
+    *) err "clean <logs|backups> [options]"; return 1 ;;
+  esac
+}
+
+clean_logs() {
+  local days="$LOG_RETENTION_DAYS" dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --days)    shift; days="${1:-$days}" ;;
+      --days=*)  days="${1#--days=}" ;;
+      --dry-run|-n) dry=1 ;;
+      *) err "clean logs: unknown arg '$1' (use --days N | --dry-run)"; return 1 ;;
+    esac; shift
+  done
+  info "Cleanup: logs older than ${days}d, cap launchd logs at ${LAUNCHD_LOG_MAX_LINES} lines, clear stale locks."
+  info "Before:  logs $(du -sh "$LOG_DIR" 2>/dev/null | awk '{print $1}')  state $(du -sh "$STATE_DIR" 2>/dev/null | awk '{print $1}')"
+  prune_state "$days" "$dry"
+  [ "$dry" = 1 ] || ok "After:   logs $(du -sh "$LOG_DIR" 2>/dev/null | awk '{print $1}')  state $(du -sh "$STATE_DIR" 2>/dev/null | awk '{print $1}')"
+}
+
+# ---------------------------------------------------------------------------
+# Backup-dir snapshots (created by 'sync' mode) live on the destination side at
+#   <backup-base>/<job>/<YYYYmmdd-HHMMSS>/...   and are NOT pruned automatically
+#   (they sit on remotes; cleaning them costs network calls, so it's explicit).
+# ---------------------------------------------------------------------------
+
+# Unique backup bases across all jobs' destinations (newline-separated; bases may
+# contain spaces, e.g. "Ralfs OneDrive:.cloudsync-backups", so never word-split).
+backups_bases() {
+  local name mode src dst extra base seen=""
+  [ -f "$JOBS_FILE" ] || return 0
+  while IFS=$'\t' read -r name mode src dst extra; do
+    case "$name" in ''|\#*) continue ;; esac
+    base="$(backup_base_for_dest "$(resolve_path "$dst")")"
+    case "
+$seen" in *"
+$base"*) ;; *) seen="$seen
+$base"; printf '%s\n' "$base" ;; esac
+  done < "$JOBS_FILE"
+}
+
+# Emit every snapshot as:  base <TAB> job <TAB> timestamp
+backups_enumerate() {
+  local base job ts
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    while IFS= read -r job; do
+      job="${job%/}"; [ -n "$job" ] || continue
+      while IFS= read -r ts; do
+        ts="${ts%/}"; [ -n "$ts" ] || continue
+        printf '%s\t%s\t%s\n' "$base" "$job" "$ts"
+      done < <(rclone lsf --dirs-only "$base/$job" 2>/dev/null)
+    done < <(rclone lsf --dirs-only "$base" 2>/dev/null)
+  done < <(backups_bases)
+}
+
+# Snapshot dir name (20260619-163900) -> epoch seconds, or empty if unparseable.
+backup_ts_epoch() { date -j -f '%Y%m%d-%H%M%S' "$1" +%s 2>/dev/null; }
+
+backups_list() {
+  local rows; rows="$(backups_enumerate)"
+  if [ -z "$rows" ]; then info "No backup snapshots found for any job's destination."; return 0; fi
+  local now; now="$(date +%s)"
+  printf '%-20s %-17s %5s %10s   %s\n' JOB SNAPSHOT AGE SIZE LOCATION
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r base job ts; do
+    local e age size
+    e="$(backup_ts_epoch "$ts")"
+    if [ -n "$e" ]; then age="$(( (now - e) / 86400 ))d"; else age="?"; fi
+    size="$(rclone size "$base/$job/$ts" 2>/dev/null | awk '/Total size/{print $3" "$4}')"
+    printf '%-20s %-17s %5s %10s   %s\n' "$job" "$ts" "$age" "${size:-?}" "$base/$job/$ts"
+  done
+}
+
+backups_clean() {
+  local days="$BACKUP_RETENTION_DAYS" keep="" dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --days)     shift; days="${1:-$days}" ;;
+      --days=*)   days="${1#--days=}" ;;
+      --keep)     shift; keep="${1:-}" ;;
+      --keep=*)   keep="${1#--keep=}" ;;
+      --dry-run|-n) dry=1 ;;
+      *) err "backups clean: unknown arg '$1' (use --days N | --keep K | --dry-run)"; return 1 ;;
+    esac; shift
+  done
+
+  local dlabel=""; [ "$dry" = 1 ] && dlabel=" (dry-run)"
+  if [ "$dry" = 1 ]; then purge() { printf '  would purge: %s\n' "$1" >&2; }
+  else purge() { rclone purge "$1" 2>/dev/null && printf '  purged: %s\n' "$1" >&2; }; fi
+
+  if [ -n "$keep" ]; then
+    # Keep the newest K snapshots per job, purge the rest.
+    info "backups clean: keeping newest $keep snapshot(s) per job${dlabel}"
+    backups_enumerate | cut -f1,2 | sort -u | while IFS=$'\t' read -r base job; do
+      local i=0 ts
+      rclone lsf --dirs-only "$base/$job" 2>/dev/null | sed 's:/$::' | sort -r | while read -r ts; do
+        [ -n "$ts" ] || continue
+        i=$((i+1))
+        [ "$i" -le "$keep" ] && continue
+        purge "$base/$job/$ts"
+      done
+    done
+  else
+    # Purge snapshots older than N days (timestamp parsed from the dir name).
+    info "backups clean: purging snapshots older than ${days} day(s)${dlabel}"
+    local now; now="$(date +%s)"
+    backups_enumerate | while IFS=$'\t' read -r base job ts; do
+      local e age
+      e="$(backup_ts_epoch "$ts")"; [ -n "$e" ] || continue
+      age="$(( (now - e) / 86400 ))"
+      [ "$age" -ge "$days" ] && purge "$base/$job/$ts"
+    done
+  fi
+
+  # Tidy now-empty job/base folders (skip in dry-run).
+  if [ "$dry" = 0 ]; then
+    while IFS= read -r base; do
+      [ -n "$base" ] && rclone rmdirs "$base" --leave-root 2>/dev/null
+    done < <(backups_bases)
+  fi
+  ok "backups clean done."
+}
+
+
+usage() {
+  cat <<EOF
+cloudsync — rclone sync orchestrator (iCloud / NextCloud / Filen / OneDrive)
+
+USAGE
+  cloudsync                      open the fzf menu (default)  ·  cloudsync menu
+
+ Sync:
+  cloudsync dry    <job|all>            preview changes, no writes — do this first
+  cloudsync run    <job|all> [--force]  run for real (--force skips the pre-flight safety gate)
+  cloudsync resync <job>                rebuild a bisync baseline (before the first bisync run)
+
+ Inspect:
+  cloudsync status                      last-run result / time / detail for every job
+  cloudsync verify <job|all> [--deep]   check the destination matches the source (sizes; --deep=hashes)
+  cloudsync list   [jobs]               show the job map (default)
+  cloudsync list   backups              backup-dir snapshots living on the destinations
+  cloudsync list   icloud-apps          iCloud app containers (the full Finder 'iCloud Drive' view)
+  cloudsync logs                        tail the most recent run log
+  cloudsync doctor                      check iCloud Full Disk Access + remote reachability
+
+ Maintain:
+  cloudsync edit                        edit the job map (\$EDITOR)
+  cloudsync clean  [logs] [--days N] [--dry-run]              prune logs / cap launchd logs / stale locks
+  cloudsync clean  backups [--days N | --keep K] [--dry-run]  purge old destination backups
+  cloudsync schedule install [manual|hourly|daily [HH:MM]|<seconds>]   set up the launchd agent
+  cloudsync schedule <kick|status|uninstall>   trigger a manual run / show schedule / remove
+
+  cloudsync help
+
+  (logs auto-prune after every run; disable with AUTO_CLEAN=0 in the config file)
+  (destination backups are NOT auto-pruned — run 'clean backups' manually or schedule it)
+
+FILES
+  jobs map : $JOBS_FILE
+  config   : $CONFIG_FILE   (optional overrides)
+  logs     : $LOG_DIR
+  backups  : <dest>/$BACKUP_ROOT_NAME/<job>/<timestamp>  (sync mode)
+
+JOB MAP FORMAT  (tab-separated)
+  name <TAB> mode <TAB> source <TAB> dest <TAB> [extra rclone flags]
+  mode = copy (add-only) | sync (mirror, deletes) | bisync (two-way)
+  Paths: 'iCloudDocs/...' = iCloud Drive files | 'iCloudAll/...' = all iCloud
+         app containers | 'Remote:path' = rclone remote.
+  Add '@prefetch' to extra to materialize dataless iCloud files first.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+main() {
+  local cmd="${1:-menu}"; shift 2>/dev/null || true
+  case "$cmd" in
+    menu|"")   cmd_menu ;;
+    list|ls)   cmd_list "$@" ;;
+    dry)       [ $# -ge 1 ] || { err "dry <job|all>"; exit 1; }; run_set "$1" 1 ;;
+    run)
+      local target="" a
+      for a in "$@"; do
+        case "$a" in
+          --force|-f) FORCE=1 ;;
+          -*) err "run: unknown flag '$a'"; exit 1 ;;
+          *)  target="$a" ;;
+        esac
+      done
+      [ -n "$target" ] || { err "run <job|all> [--force]"; exit 1; }
+      run_set "$target" 0 ;;
+    resync)    [ $# -ge 1 ] || { err "resync <job>"; exit 1; }; run_job "$1" 0 1 ;;
+    verify)    cmd_verify "$@" ;;
+    status)    cmd_status ;;
+    edit)      "${EDITOR:-vi}" "$JOBS_FILE" ;;
+    logs)      cmd_logs ;;
+    doctor)    cmd_doctor ;;
+    clean)     cmd_clean "$@" ;;
+    schedule)  cmd_schedule "$@" ;;
+    help|-h|--help) usage ;;
+    *)         err "Unknown command: $cmd"; usage; exit 1 ;;
+  esac
+}
+main "$@"
