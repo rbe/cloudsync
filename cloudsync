@@ -61,6 +61,13 @@ NOTIFY=auto               # macOS notification on failure/abort: auto (non-inter
 # Load user overrides if present
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
+# User-writable bin (make setup / cloudsync setup). Prepend so a just-installed
+# rclone is found even if the parent shell has not updated PATH yet.
+USER_BIN="${CLOUDSYNC_BINDIR:-$HOME/.local/bin}"
+_user_bin_on_path=0
+case ":$PATH:" in *":$USER_BIN:"*) _user_bin_on_path=1 ;; esac
+[ "$_user_bin_on_path" = 1 ] || PATH="$USER_BIN:$PATH"
+
 mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$STATE_DIR" "$LOCK_DIR" 2>/dev/null
 
 TS() { date +%Y%m%d-%H%M%S; }
@@ -74,17 +81,135 @@ else
   ok()   { printf '%s\n' "$*" >&2; }
 fi
 
-# Installed command (make setup → ~/.local/bin/cloudsync); fall back to this file.
+# Installed command (cloudsync setup → ~/.local/bin/cloudsync); fall back to this file.
 program_path() {
-  local inst="${CLOUDSYNC_BIN:-$HOME/.local/bin/cloudsync}"
+  local inst="${CLOUDSYNC_BIN:-$USER_BIN/cloudsync}"
   if [ -x "$inst" ]; then printf '%s' "$inst"
   else printf '%s/cloudsync' "$PROJECT_DIR"; fi
 }
 
 need_rclone() {
   command -v rclone >/dev/null 2>&1 && return 0
-  err "rclone not found on PATH. Install: https://rclone.org/downloads/  (or: make deps)"
+  err "rclone not found. Run: cloudsync setup"
   return 1
+}
+
+# Copy $2 → $1 if dest is missing. Returns 1 if dest is missing AND src is missing
+# (caller writes a builtin). Never overwrites an existing dest.
+_seed_file() {
+  local dest="$1" src="$2"
+  if [ -f "$dest" ]; then info "keep    $dest"; return 0; fi
+  if [ -f "$src" ]; then cp "$src" "$dest" || return 1; ok "seeded  $dest"; return 0; fi
+  return 1
+}
+
+_install_self() {
+  local dest="$USER_BIN/cloudsync" src="$PROJECT_DIR/cloudsync"
+  mkdir -p "$USER_BIN" || return 1
+  if [ -e "$dest" ] && [ "$src" -ef "$dest" ]; then
+    ok "cloudsync: $dest"
+    return 0
+  fi
+  ln -sfn "$src" "$dest" || return 1
+  ok "cloudsync: $dest -> $src"
+}
+
+# Official zip into $1/rclone. No Homebrew, no sudo. Skip if rclone is already on PATH.
+_install_rclone() {
+  local bindir="$1" arch url tmp src_bin
+  if command -v rclone >/dev/null 2>&1; then
+    ok "rclone: $(command -v rclone)"
+    return 0
+  fi
+  case "$(uname -m)" in
+    arm64|aarch64) arch=arm64 ;;
+    x86_64)        arch=amd64 ;;
+    *) err "unsupported architecture $(uname -m) (need arm64 or x86_64)"; return 1 ;;
+  esac
+  command -v curl  >/dev/null 2>&1 || { err "curl is required to install rclone"; return 1; }
+  command -v unzip >/dev/null 2>&1 || { err "unzip is required to install rclone"; return 1; }
+  url="https://downloads.rclone.org/rclone-current-osx-${arch}.zip"
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/cloudsync-rclone.XXXXXX") || return 1
+  info "Downloading rclone ($arch) — $url"
+  if ! curl -fL --retry 3 --retry-delay 2 -o "$tmp/rclone.zip" "$url"; then
+    rm -rf "$tmp"
+    err "download failed. Manual: https://rclone.org/downloads/"
+    return 1
+  fi
+  if ! unzip -qo "$tmp/rclone.zip" -d "$tmp"; then
+    rm -rf "$tmp"
+    err "failed to unzip rclone"
+    return 1
+  fi
+  src_bin=""
+  for src_bin in "$tmp"/rclone-*/rclone; do
+    [ -f "$src_bin" ] && break
+    src_bin=""
+  done
+  if [ -z "$src_bin" ]; then
+    rm -rf "$tmp"
+    err "rclone binary not found in the archive"
+    return 1
+  fi
+  mkdir -p "$bindir" || { rm -rf "$tmp"; return 1; }
+  cp "$src_bin" "$bindir/rclone" || { rm -rf "$tmp"; return 1; }
+  chmod 755 "$bindir/rclone"
+  xattr -d com.apple.quarantine "$bindir/rclone" 2>/dev/null || true
+  rm -rf "$tmp"
+  ok "rclone: $bindir/rclone"
+}
+
+_seed_config() {
+  mkdir -p "$CONFIG_DIR" || return 1
+  if ! _seed_file "$JOBS_FILE" "$PROJECT_DIR/examples/jobs.tsv"; then
+    {
+      printf '%s\n' "# cloudsync job map — TAB-separated columns:"
+      printf '%s\n' "#   name  mode  source  dest  [extra rclone flags]"
+      printf '%s\n' "# mode: copy (add-only) | sync (mirror, deletes) | bisync (two-way)"
+      printf '%s\n' "# Uncomment a line, edit remotes/paths, then: cloudsync dry <name>"
+      printf '%s\n' "#"
+      printf '#%s\t%s\t%s\t%s\t%s\n' \
+        'icloud-to-nx' 'sync' 'iCloudAll' 'Remote:backup/iCloud' \
+        '@prefetch --filter-from ~/.config/cloudsync/icloud.filter'
+    } > "$JOBS_FILE" || return 1
+    ok "seeded  $JOBS_FILE"
+  fi
+  if ! _seed_file "$CONFIG_DIR/icloud.filter" "$PROJECT_DIR/examples/icloud.filter"; then
+    printf '%s\n' \
+      '+ /com~apple~CloudDocs/**' \
+      '+ /*/Documents/**' \
+      '- **' > "$CONFIG_DIR/icloud.filter" || return 1
+    ok "seeded  $CONFIG_DIR/icloud.filter"
+  fi
+  if ! _seed_file "$CONFIG_FILE" "$PROJECT_DIR/examples/config"; then
+    printf '%s\n' \
+      '# Optional cloudsync overrides (sourced as bash). Uncomment to change defaults.' \
+      '#MAX_DELETE=50' \
+      '#NOTIFY=auto' > "$CONFIG_FILE" || return 1
+    ok "seeded  $CONFIG_FILE"
+  fi
+}
+
+# First-run bootstrap: link this script, fetch rclone, seed config. No Homebrew.
+cmd_setup() {
+  [ "$(uname -s)" = Darwin ] || { err "cloudsync setup is for macOS"; return 1; }
+  mkdir -p "$USER_BIN" "$CONFIG_DIR" || return 1
+  _install_self || return 1
+  _install_rclone "$USER_BIN" || return 1
+  _seed_config || return 1
+  echo
+  if [ "$_user_bin_on_path" != 1 ]; then
+    info "Add $USER_BIN to PATH (e.g. in ~/.zprofile):"
+    info "  export PATH=\"$USER_BIN:\$PATH\""
+    info "then:  hash -r   (or open a new terminal)"
+    echo
+  fi
+  ok "Setup complete. Next:"
+  info "  1. rclone config"
+  info "     (add NextCloud/Filen/OneDrive remotes; skip if you only use iCloud)"
+  info "  2. Grant Full Disk Access to: $(command -v rclone 2>/dev/null || printf '%s' "$USER_BIN/rclone")"
+  info "     System Settings → Privacy & Security → Full Disk Access"
+  info "  3. cloudsync edit            # then:  cloudsync dry <job|all>"
 }
 
 # Lock held by the job currently running, so a signal handler can release it.
@@ -438,8 +563,14 @@ cmd_list() {
 # fzf menu
 # ---------------------------------------------------------------------------
 cmd_menu() {
+  if ! command -v fzf >/dev/null 2>&1; then
+    info "fzf not installed — interactive menu skipped (optional)."
+    list_jobs 2>/dev/null || info "No jobs yet. Run: cloudsync setup   then   cloudsync edit"
+    info "cloudsync dry  <job|all>     preview"
+    info "cloudsync run  <job|all>     run for real"
+    return 0
+  fi
   need_rclone || return 1
-  command -v fzf >/dev/null 2>&1 || { err "fzf not installed (make deps / brew install fzf)"; return 1; }
   local rows sel name action
   rows="$( { printf 'all\tALL\trun every job\n'; \
              while IFS=$'\t' read -r name mode src dst extra; do
@@ -506,7 +637,7 @@ $trigger
   <key>StandardOutPath</key>  <string>$LOG_DIR/launchd.out.log</string>
   <key>StandardErrorPath</key><string>$LOG_DIR/launchd.err.log</string>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <dict><key>PATH</key><string>$USER_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
 </dict>
 </plist>
 PLIST
@@ -544,19 +675,19 @@ cmd_logs() {
 # Access. Run via 'schedule kick' against a probe to test the launchd context.
 cmd_doctor() {
   info "cloudsync doctor"
-  printf '  cloudsync : %s\n' "$(command -v cloudsync || echo "NOT ON PATH (make setup → $HOME/.local/bin)")"
+  printf '  cloudsync : %s\n' "$(command -v cloudsync || echo "NOT ON PATH (cloudsync setup → $USER_BIN)")"
   printf '  script    : %s\n' "$PROJECT_DIR/cloudsync"
   printf '  launchd   : %s\n' "$(program_path)"
   printf '  bash      : %s (%s)\n' "${BASH:-/bin/bash}" "${BASH_VERSION:-unknown}"
-  printf '  rclone    : %s\n' "$(command -v rclone || echo MISSING)"
-  printf '  fzf       : %s\n' "$(command -v fzf || echo "MISSING (make deps; needed for the menu)")"
+  printf '  rclone    : %s\n' "$(command -v rclone || echo "MISSING (cloudsync setup)")"
+  printf '  fzf       : %s\n' "$(command -v fzf || echo "optional (interactive menu)")"
   printf '  jobs      : %s\n' "$JOBS_FILE"
   if [ ! -f "$JOBS_FILE" ]; then
-    err "              missing — make setup seeds examples, or: cloudsync edit"
+    err "              missing — cloudsync setup seeds a template, or: cloudsync edit"
   fi
   printf '  iCloud    : %s\n' "$ICLOUD_ROOT"
   if ! command -v rclone >/dev/null 2>&1; then
-    err "rclone is required. From the project dir: make deps"
+    err "rclone is required. Run: cloudsync setup"
     return 1
   fi
   local out
@@ -816,7 +947,8 @@ usage() {
 cloudsync — rclone sync orchestrator (iCloud / NextCloud / Filen / OneDrive)
 
 USAGE
-  cloudsync                      open the fzf menu (default)  ·  cloudsync menu
+  cloudsync setup                       first run: rclone + ~/.local/bin (no Homebrew)
+  cloudsync                             menu (fzf) or a job list if fzf is missing
 
  Sync:
   cloudsync dry    <job|all>            preview changes, no writes — do this first
@@ -841,8 +973,6 @@ USAGE
 
   cloudsync help
 
-  Install / PATH:  make setup   (from the project dir → ~/.local/bin/cloudsync)
-
   (logs auto-prune after every run; disable with AUTO_CLEAN=0 in the config file)
   (destination backups are NOT auto-pruned — run 'clean backups' manually or schedule it)
 
@@ -865,6 +995,7 @@ EOF
 main() {
   local cmd="${1:-menu}"; shift 2>/dev/null || true
   case "$cmd" in
+    setup)     cmd_setup ;;
     menu|"")   cmd_menu ;;
     list|ls)   cmd_list "$@" ;;
     dry)       [ $# -ge 1 ] || { err "dry <job|all>"; exit 1; }; run_set "$1" 1 ;;
