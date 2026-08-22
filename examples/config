@@ -1,0 +1,36 @@
+# cloudsync configuration — sourced as bash by the cloudsync script.
+# Uncomment and edit any line to override the built-in default.
+# This file is optional; deleting it restores defaults.
+
+# --- rclone tuning -----------------------------------------------------------
+#TRANSFERS=6                 # parallel file transfers
+#CHECKERS=12                 # parallel checkers (hash/size compares)
+
+# --- safety gate (sync/bisync real runs) -------------------------------------
+#MAX_DELETE=50               # abort a run that would delete more than this many files
+                             # (override per-run with: cloudsync run <job> --force)
+
+# --- log / state housekeeping ------------------------------------------------
+#AUTO_CLEAN=1                # 1 = prune logs automatically after each run/dry, 0 = off
+#LOG_RETENTION_DAYS=30       # delete per-run logs older than this many days
+#LAUNCHD_LOG_MAX_LINES=2000  # cap the appended launchd.out/err logs to this many lines
+#LOCK_STALE_HOURS=12         # remove orphaned lock dirs older than this (crashed runs)
+
+# --- destination backup snapshots (sync mode) --------------------------------
+#BACKUP_RETENTION_DAYS=90    # default age cutoff for: cloudsync clean backups
+#BACKUP_ROOT_NAME=".cloudsync-backups"   # folder name used on each destination
+
+# --- notifications -----------------------------------------------------------
+#NOTIFY=auto                 # macOS notification on failure/abort:
+                             #   auto = only for non-interactive (launchd) runs
+                             #   always = also for manual runs | never = off
+
+# --- scheduling --------------------------------------------------------------
+#LAUNCHD_LABEL="com.user.cloudsync"      # launchd job label
+
+# --- paths (normally leave unset; OS defaults are used automatically) --------
+# Defaults: config ~/.config/cloudsync, state ~/.local/state/cloudsync,
+#           logs ~/Library/Logs/cloudsync.
+#CLOUDSYNC_CONFIG_DIR="$HOME/.config/cloudsync"
+#CLOUDSYNC_LOG_DIR="$HOME/Library/Logs/cloudsync"
+#CLOUDSYNC_STATE_DIR="$HOME/.local/state/cloudsync"

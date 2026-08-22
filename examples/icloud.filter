@@ -1,0 +1,9 @@
+# cloudsync iCloud filter — used with source 'iCloudAll' (~/Library/Mobile Documents)
+# to back up exactly what Finder shows as "iCloud Drive":
+#   - com~apple~CloudDocs/**   = loose iCloud Drive files (Desktop/Documents incl.)
+#   - <any app container>/Documents/**  = each app's iCloud files (Obsidian, Preview, Pages, …)
+# Everything else (app caches, .Trash, support data outside Documents) is excluded.
+# Rules are first-match-wins, top to bottom.
++ /com~apple~CloudDocs/**
++ /*/Documents/**
+- **

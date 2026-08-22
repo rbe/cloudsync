@@ -1,9 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #
 # cloudsync — drive rclone syncs between iCloud, NextCloud, Filen (and OneDrive)
 # from a simple per-job map. See: cloudsync help
 #
 # Written for stock macOS bash 3.2 — no bash4-isms.
+# Empty-array expansions use ${arr[@]+"${arr[@]}"} so `set -u` is safe on 3.2.
 
 set -u
 set -o pipefail
@@ -63,9 +64,28 @@ NOTIFY=auto               # macOS notification on failure/abort: auto (non-inter
 mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$STATE_DIR" "$LOCK_DIR" 2>/dev/null
 
 TS() { date +%Y%m%d-%H%M%S; }
-err() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
-info() { printf '\033[36m%s\033[0m\n' "$*" >&2; }
-ok()  { printf '\033[32m%s\033[0m\n' "$*" >&2; }
+if [ -t 2 ]; then
+  err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+  info() { printf '\033[36m%s\033[0m\n' "$*" >&2; }
+  ok()   { printf '\033[32m%s\033[0m\n' "$*" >&2; }
+else
+  err()  { printf '%s\n' "$*" >&2; }
+  info() { printf '%s\n' "$*" >&2; }
+  ok()   { printf '%s\n' "$*" >&2; }
+fi
+
+# Installed command (make setup → ~/.local/bin/cloudsync); fall back to this file.
+program_path() {
+  local inst="${CLOUDSYNC_BIN:-$HOME/.local/bin/cloudsync}"
+  if [ -x "$inst" ]; then printf '%s' "$inst"
+  else printf '%s/cloudsync' "$PROJECT_DIR"; fi
+}
+
+need_rclone() {
+  command -v rclone >/dev/null 2>&1 && return 0
+  err "rclone not found on PATH. Install: https://rclone.org/downloads/  (or: make deps)"
+  return 1
+}
 
 # Lock held by the job currently running, so a signal handler can release it.
 CURRENT_LOCK=""
@@ -171,6 +191,22 @@ job_names() {
   done < "$JOBS_FILE"
 }
 
+# Parse the jobs.tsv extra column. Sets EXTRA_ARGS (array) and DO_PREFETCH (0/1).
+# Expands a leading ~/ on flag arguments (rclone does not).
+parse_extra() {
+  local extra="${1:-}" _i
+  DO_PREFETCH=0
+  EXTRA_ARGS=()
+  case " $extra " in *" @prefetch "*) DO_PREFETCH=1; extra="${extra//@prefetch/}" ;; esac
+  extra="$(printf '%s' "$extra" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ -n "$extra" ] || return 0
+  # shellcheck disable=SC2086
+  read -r -a EXTRA_ARGS <<< "$extra"
+  for _i in "${!EXTRA_ARGS[@]}"; do
+    case "${EXTRA_ARGS[$_i]}" in "~/"*) EXTRA_ARGS[$_i]="$HOME/${EXTRA_ARGS[$_i]#\~/}" ;; esac
+  done
+}
+
 # Look up one job; sets globals J_NAME J_MODE J_SRC J_DST J_EXTRA. Returns 1 if absent.
 load_job() {
   local want="$1"
@@ -190,8 +226,12 @@ load_job() {
 # Pre-flight safety gate (sync/bisync, real runs only)
 # ---------------------------------------------------------------------------
 # Count files rclone can actually see at a path (0 => empty OR unreadable).
+# Uses --json so humanized size output ("1.234k") cannot be mis-parsed as 1.
 count_objects() {
-  rclone size "$1" "${@:2}" 2>/dev/null | grep 'Total objects' | grep -oE '[0-9]+' | head -1
+  local json n
+  json="$(rclone size --json "$1" "${@:2}" 2>/dev/null)" || json=""
+  n="$(printf '%s' "$json" | sed -n 's/.*"count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+  printf '%s' "${n:-0}"
 }
 
 # Refuse if a path lists 0 files — the classic "source came back empty because
@@ -213,12 +253,17 @@ preflight_empty() {
 # delete on the destination, and stop (before touching anything) if it's too many.
 preflight_guard() {
   local name="$1" src="$2" dst="$3"; shift 3
-  local -a xa=("$@")
   info "[$name] pre-flight: checking source size and deletion impact…"
-  preflight_empty "$name" "$src" "${xa[@]}" || return 1
+  preflight_empty "$name" "$src" "$@" || return 1
   local dlog="$STATE_DIR/preflight-$name.log" ndel
-  rclone sync "$src" "$dst" --dry-run "${xa[@]}" >"$dlog" 2>&1 || true
+  rclone sync "$src" "$dst" --dry-run --max-delete "$MAX_DELETE" "$@" >"$dlog" 2>&1 || true
   ndel="$(grep 'Deleted:' "$dlog" | tail -1 | grep -oE '[0-9]+' | head -1)"; ndel="${ndel:-0}"
+  if grep -qiE 'max[- ]delete' "$dlog"; then
+    err "[$name] ABORT: this run would exceed --max-delete $MAX_DELETE (rclone refused the dry-run)."
+    err "          Deletion preview: $dlog"
+    err "          If that is intended, run: cloudsync run $name --force"
+    return 1
+  fi
   if [ "$ndel" -gt "$MAX_DELETE" ]; then
     err "[$name] ABORT: this run would delete $ndel file(s) on the destination (limit $MAX_DELETE)."
     err "          Deletion preview: $dlog"
@@ -259,15 +304,14 @@ run_job() {
 _do_job() {
   local name="$1" dry="${2:-0}" resync="${3:-0}"
   local start=$SECONDS
+  need_rclone || return 1
   load_job "$name" || return 1
 
   local src dst
   src="$(resolve_path "$J_SRC")"
   dst="$(resolve_path "$J_DST")"
 
-  # Pull @prefetch out of the extra flags
-  local extra="$J_EXTRA" do_prefetch=0
-  case " $extra " in *" @prefetch "*) do_prefetch=1; extra="${extra//@prefetch/}" ;; esac
+  parse_extra "$J_EXTRA"
 
   local log="$LOG_DIR/$name-$(TS).log"
 
@@ -278,33 +322,20 @@ _do_job() {
   if [ -t 1 ]; then ui_flags="--progress"
   else ui_flags="--stats=1m"; fi
 
-  # split extra flags into argv safely
-  local -a extra_args=()
-  # shellcheck disable=SC2086
-  read -r -a extra_args <<< "$extra"
-  # Expand a leading ~/ in flag args (e.g. --filter-from ~/.config/...), since
-  # these reach rclone as raw argv and neither rclone nor a shell expands them.
-  if [ "${#extra_args[@]}" -gt 0 ]; then
-    local _i
-    for _i in "${!extra_args[@]}"; do
-      case "${extra_args[$_i]}" in "~/"*) extra_args[$_i]="$HOME/${extra_args[$_i]#\~/}" ;; esac
-    done
-  fi
-
   local -a common=(--transfers "$TRANSFERS" --checkers "$CHECKERS" \
                    --log-file "$log" --log-level INFO $ui_flags)
   [ "$dry" = 1 ] && common+=(--dry-run)
 
-  [ "$do_prefetch" = 1 ] && prefetch_icloud "$src" "$dst"
+  [ "$DO_PREFETCH" = 1 ] && prefetch_icloud "$src" "$dst"
 
   # Safety gate: on real (non-dry) runs, never let a mirror silently delete a lot,
   # or wipe a side because the other came back empty/unreadable. --force bypasses.
   if [ "$dry" = 0 ] && [ "$FORCE" = 0 ]; then
     local _abort=""
     case "$J_MODE" in
-      sync)   preflight_guard "$name" "$src" "$dst" --exclude "/$BACKUP_ROOT_NAME/**" "${extra_args[@]}" || _abort=1 ;;
-      bisync) preflight_empty "$name" "$src" "${extra_args[@]}" && \
-              preflight_empty "$name" "$dst" "${extra_args[@]}" || _abort=1 ;;
+      sync)   preflight_guard "$name" "$src" "$dst" --exclude "/$BACKUP_ROOT_NAME/**" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" || _abort=1 ;;
+      bisync) preflight_empty "$name" "$src" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" && \
+              preflight_empty "$name" "$dst" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" || _abort=1 ;;
     esac
     if [ -n "$_abort" ]; then
       record_status "$name" 1 $((SECONDS-start)) aborted "pre-flight safety gate"
@@ -319,7 +350,7 @@ _do_job() {
   local -a cmd
   case "$J_MODE" in
     copy)
-      cmd=(rclone copy "$src" "$dst" "${common[@]}" "${extra_args[@]}")
+      cmd=(rclone copy "$src" "$dst" "${common[@]}" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}")
       ;;
     sync)
       # Keep overwritten/deleted files in a backup dir, and exclude that dir from
@@ -328,12 +359,12 @@ _do_job() {
       local bk; bk="$(backup_dir_for "$name" "$dst")"
       cmd=(rclone sync "$src" "$dst" --backup-dir "$bk" \
            --exclude "/$BACKUP_ROOT_NAME/**" \
-           --max-delete "$MAX_DELETE" "${common[@]}" "${extra_args[@]}")
+           --max-delete "$MAX_DELETE" "${common[@]}" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}")
       ;;
     bisync)
       cmd=(rclone bisync "$src" "$dst" --resilient --recover \
            --conflict-resolve newer --conflict-loser pathname \
-           --max-delete "$MAX_DELETE" "${common[@]}" "${extra_args[@]}")
+           --max-delete "$MAX_DELETE" "${common[@]}" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}")
       [ "$resync" = 1 ] && cmd+=(--resync)
       ;;
     *)
@@ -407,7 +438,8 @@ cmd_list() {
 # fzf menu
 # ---------------------------------------------------------------------------
 cmd_menu() {
-  command -v fzf >/dev/null 2>&1 || { err "fzf not installed (brew install fzf)"; return 1; }
+  need_rclone || return 1
+  command -v fzf >/dev/null 2>&1 || { err "fzf not installed (make deps / brew install fzf)"; return 1; }
   local rows sel name action
   rows="$( { printf 'all\tALL\trun every job\n'; \
              while IFS=$'\t' read -r name mode src dst extra; do
@@ -465,7 +497,7 @@ cmd_schedule() {
   <key>Label</key>            <string>$LAUNCHD_LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$PROJECT_DIR/cloudsync</string>
+    <string>$(program_path)</string>
     <string>run</string>
     <string>all</string>
   </array>
@@ -512,26 +544,41 @@ cmd_logs() {
 # Access. Run via 'schedule kick' against a probe to test the launchd context.
 cmd_doctor() {
   info "cloudsync doctor"
-  printf '  rclone : %s\n' "$(command -v rclone || echo MISSING)"
-  printf '  iCloud : %s\n' "$ICLOUD_ROOT"
+  printf '  cloudsync : %s\n' "$(command -v cloudsync || echo "NOT ON PATH (make setup → $HOME/.local/bin)")"
+  printf '  script    : %s\n' "$PROJECT_DIR/cloudsync"
+  printf '  launchd   : %s\n' "$(program_path)"
+  printf '  bash      : %s (%s)\n' "${BASH:-/bin/bash}" "${BASH_VERSION:-unknown}"
+  printf '  rclone    : %s\n' "$(command -v rclone || echo MISSING)"
+  printf '  fzf       : %s\n' "$(command -v fzf || echo "MISSING (make deps; needed for the menu)")"
+  printf '  jobs      : %s\n' "$JOBS_FILE"
+  if [ ! -f "$JOBS_FILE" ]; then
+    err "              missing — make setup seeds examples, or: cloudsync edit"
+  fi
+  printf '  iCloud    : %s\n' "$ICLOUD_ROOT"
+  if ! command -v rclone >/dev/null 2>&1; then
+    err "rclone is required. From the project dir: make deps"
+    return 1
+  fi
   local out
   out="$(rclone lsf --dirs-only "$ICLOUD_ROOT" 2>&1)"
   if printf '%s' "$out" | grep -qiE 'permission denied|operation not permitted|not permitted|error'; then
-    err "         NOT readable here — $(printf '%s' "$out" | head -1)"
-    err "         => this context lacks Full Disk Access (fine for Terminal; required for launchd)."
+    err "              NOT readable here — $(printf '%s' "$out" | head -1)"
+    err "              => this context lacks Full Disk Access (fine for Terminal; required for launchd)."
+    err "              Grant FDA to rclone in System Settings → Privacy & Security → Full Disk Access."
   else
-    ok "         readable ($(printf '%s\n' "$out" | grep -c .) top-level folders)"
+    ok "              readable ($(printf '%s\n' "$out" | grep -c .) top-level folders)"
   fi
   while IFS= read -r r; do
     [ -n "$r" ] || continue
-    if rclone lsd "$r" --max-depth 1 >/dev/null 2>&1; then ok "  remote  $r reachable"
-    else err "  remote  $r NOT reachable"; fi
+    if rclone lsd "$r" --max-depth 1 >/dev/null 2>&1; then ok "  remote    $r reachable"
+    else err "  remote    $r NOT reachable"; fi
   done < <(rclone listremotes 2>/dev/null)
 }
 
 # List the iCloud containers under "Mobile Documents" so you can see everything
 # Finder merges into "iCloud Drive" (com~apple~CloudDocs + each app's Documents).
 cmd_icloud_apps() {
+  need_rclone || return 1
   info "iCloud containers under: $ICLOUD_MOBILE"
   info "(folder on disk  ->  items in its Documents)"
   local name docs n
@@ -567,19 +614,16 @@ cmd_status() {
 # Default compares sizes (fast, no iCloud downloads); --deep compares hashes.
 verify_job() {
   local name="$1" deep="${2:-0}"
+  need_rclone || return 1
   load_job "$name" || return 1
   local src dst; src="$(resolve_path "$J_SRC")"; dst="$(resolve_path "$J_DST")"
-  local extra="${J_EXTRA//@prefetch/}"
-  local -a xa=(); read -r -a xa <<< "$extra"
-  if [ "${#xa[@]}" -gt 0 ]; then
-    local _i; for _i in "${!xa[@]}"; do case "${xa[$_i]}" in "~/"*) xa[$_i]="$HOME/${xa[$_i]#\~/}" ;; esac; done
-  fi
-  [ "$J_MODE" = sync ] && xa+=(--exclude "/$BACKUP_ROOT_NAME/**")
+  parse_extra "$J_EXTRA"
+  [ "$J_MODE" = sync ] && EXTRA_ARGS+=(--exclude "/$BACKUP_ROOT_NAME/**")
   local log="$LOG_DIR/verify-$name-$(TS).log"
   local -a cmp=(--one-way --log-file "$log" --log-level NOTICE)
   local how="sizes"; if [ "$deep" = 1 ]; then how="hashes"; else cmp+=(--size-only); fi
   info "[$name] verify ($how, one-way): $src  vs  $dst"
-  rclone check "$src" "$dst" "${cmp[@]}" "${xa[@]}"
+  rclone check "$src" "$dst" "${cmp[@]}" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
   local rc=$?
   if [ $rc -eq 0 ]; then ok "[$name] verify OK — destination has every source file (matching $how)"
   else err "[$name] verify: differences found (rc=$rc) — see $log"; fi
@@ -701,6 +745,7 @@ backups_enumerate() {
 backup_ts_epoch() { date -j -f '%Y%m%d-%H%M%S' "$1" +%s 2>/dev/null; }
 
 backups_list() {
+  need_rclone || return 1
   local rows; rows="$(backups_enumerate)"
   if [ -z "$rows" ]; then info "No backup snapshots found for any job's destination."; return 0; fi
   local now; now="$(date +%s)"
@@ -715,6 +760,7 @@ backups_list() {
 }
 
 backups_clean() {
+  need_rclone || return 1
   local days="$BACKUP_RETENTION_DAYS" keep="" dry=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -794,6 +840,8 @@ USAGE
   cloudsync schedule <kick|status|uninstall>   trigger a manual run / show schedule / remove
 
   cloudsync help
+
+  Install / PATH:  make setup   (from the project dir → ~/.local/bin/cloudsync)
 
   (logs auto-prune after every run; disable with AUTO_CLEAN=0 in the config file)
   (destination backups are NOT auto-pruned — run 'clean backups' manually or schedule it)
