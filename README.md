@@ -18,7 +18,7 @@ That will:
 - install rclone at `~/.local/bin/rclone` (even if Homebrew already has one — that copy is the Full Disk Access target; `cloudsync setup --upgrade` refreshes it)
 - seed `~/.config/cloudsync/` from `examples/` without overwriting files you already have
 
-`make setup` does the same thing. Shipping plan: [docs/waves.md](docs/waves.md) (Wave 2 now).
+`make setup` does the same thing. Shipping plan: [docs/waves.md](docs/waves.md) (Wave 3 now).
 
 If `~/.local/bin` is not **first** on your PATH, add this to `~/.zprofile` and open a new terminal:
 
@@ -46,7 +46,7 @@ export PATH="$HOME/.local/bin:$PATH"
 | `dry <job\|all>` | preview, no writes |
 | `run <job\|all> [--force]` | real run (`--force` skips the safety gate) |
 | `resync <job>` | first-time bisync baseline |
-| `status` / `verify` / `logs` / `doctor` | inspect last run, destination, logs, FDA |
+| `status` / `verify` / `logs` / `doctor` | inspect last run, destination, logs, FDA + job map |
 | `edit` | job map in `$EDITOR` |
 | `list [jobs\|backups\|icloud-apps]` | job map, destination snapshots, iCloud containers |
 | `schedule install …` | launchd (`hourly`, `daily HH:MM`, or interval seconds) |
