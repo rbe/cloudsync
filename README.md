@@ -37,7 +37,7 @@ export PATH="$HOME/.local/bin:$PATH"
 5. **Preview:** `cloudsync dry <job|all>`
 6. **Run:** `cloudsync run <job|all>`
 
-`cloudsync help` lists every command. Shipping plan: [docs/waves.md](docs/waves.md) (Wave 3 now).
+`cloudsync help` lists every command. Shipping plan: [docs/waves.md](docs/waves.md) (Wave 4 now).
 
 ## Commands
 
@@ -48,7 +48,7 @@ export PATH="$HOME/.local/bin:$PATH"
 | `run <job\|all> [--force]` | real run (`--force` skips the safety gate) |
 | `resync <job>` | first-time bisync baseline |
 | `status` / `verify` / `logs` / `doctor` | inspect last run, destination, logs, FDA + job map |
-| `edit` | job map in `$EDITOR` |
+| `edit` | job map in `$EDITOR`, then validate tabs / placeholders |
 | `list [jobs\|backups\|icloud-apps]` | job map, destination snapshots, iCloud containers |
 | `schedule install …` | launchd (`hourly`, `daily HH:MM`, or interval seconds) |
 | `clean logs` / `clean backups` | prune local logs or destination backup snapshots |
@@ -57,7 +57,7 @@ Bare `cloudsync` opens an interactive menu if [fzf](https://github.com/junegunn/
 
 ## Job map
 
-`~/.config/cloudsync/jobs.tsv` — **one TAB between columns**, not spaces:
+`~/.config/cloudsync/jobs.tsv` — **one TAB between columns**, not spaces. `cloudsync edit` and `dry` reject a space-separated row and leftover `Remote:` placeholders.
 
 ```
 name<TAB>mode<TAB>source<TAB>dest<TAB>[extra rclone flags]
