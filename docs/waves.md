@@ -1,8 +1,6 @@
 # Shipping waves
 
-cloudsync ships as a stock-macOS script. Each wave is a slice that can run in production; later waves do not rewrite earlier ones.
-
-**Now shipping: Wave 4.**
+Four slices, all shipped. Each wave is still a production slice; later waves did not rewrite earlier ones.
 
 ## Wave 1 — FDA-stable rclone
 
