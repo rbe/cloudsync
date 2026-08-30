@@ -9,8 +9,9 @@
 # paths: iCloudDocs/<sub> = iCloud Drive files | iCloudAll/<sub> = all iCloud app containers | Name:path = rclone remote (replace Remote: in the examples)
 # extra: any rclone flags, e.g. --filter-from <file>, --exclude '*.tmp', or @prefetch (materialize iCloud stubs)
 #
-# IMPORTANT: columns are separated by a single TAB, not spaces. `cloudsync edit` opens this file.
-# `cloudsync doctor` checks remotes and bisync baselines. Uncomment an example, set real remotes, then `cloudsync dry <name>`.
+# IMPORTANT: columns are separated by a single TAB, not spaces. `cloudsync edit` / `dry` / `run` reject space-separated rows.
+# Uncommenting a Remote: line as-is also fails — replace Remote: with a name from `rclone listremotes`.
+# Then: cloudsync doctor   and   cloudsync dry <name>.
 
 #name	mode	source	dest	extra
 #icloud-to-nx	sync	iCloudAll	Remote:backup/iCloud	@prefetch --filter-from ~/.config/cloudsync/icloud.filter
