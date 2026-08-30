@@ -37,15 +37,15 @@ export PATH="$HOME/.local/bin:$PATH"
 5. **Preview:** `cloudsync dry <job|all>`
 6. **Run:** `cloudsync run <job|all>`
 
-`cloudsync help` lists every command. Shipping plan: [docs/waves.md](docs/waves.md) (Wave 4 now).
+`cloudsync help` lists every command. Shipped waves: [docs/waves.md](docs/waves.md).
 
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
 | `setup [--upgrade]` | copy this script + rclone into `~/.local/bin`; seed config |
-| `dry <job\|all>` | preview, no writes |
-| `run <job\|all> [--force]` | real run (`--force` skips the safety gate) |
+| `dry <job\|all>` | preview, no writes; also validates the job map |
+| `run <job\|all> [--force]` | real run (`--force` skips empty-source / max-delete only) |
 | `resync <job>` | first-time bisync baseline |
 | `status` / `verify` / `logs` / `doctor` | inspect last run, destination, logs, FDA + job map |
 | `edit` | job map in `$EDITOR`, then validate tabs / placeholders |
@@ -57,7 +57,7 @@ Bare `cloudsync` opens an interactive menu if [fzf](https://github.com/junegunn/
 
 ## Job map
 
-`~/.config/cloudsync/jobs.tsv` — **one TAB between columns**, not spaces. `cloudsync edit` and `dry` reject a space-separated row and leftover `Remote:` placeholders.
+`~/.config/cloudsync/jobs.tsv` — **one TAB between columns**, not spaces. `cloudsync edit`, `dry`, and `run` reject a space-separated row and leftover `Remote:` placeholders.
 
 ```
 name<TAB>mode<TAB>source<TAB>dest<TAB>[extra rclone flags]
@@ -80,7 +80,7 @@ In extra flags, `@prefetch` runs `brctl download` so dataless iCloud files becom
 
 ## Safety
 
-On real `sync` / `bisync` runs, cloudsync aborts if a side lists 0 files (empty or unreadable — the usual Full Disk Access miss), or if a `sync` would delete more than `MAX_DELETE` files (default 50). Override with `cloudsync run <job> --force`.
+On real `sync` / `bisync` runs, cloudsync aborts if a side lists 0 files (empty or unreadable — the usual Full Disk Access miss), or if a `sync` would delete more than `MAX_DELETE` files (default 50). `cloudsync run <job> --force` skips that gate only. It does **not** skip job-map validation or the bisync baseline check (`cloudsync resync <job>` is still required before the first bisync run).
 
 Sync backups on the destination are **not** auto-pruned (`cloudsync clean backups`). Per-run logs are pruned after each run unless `AUTO_CLEAN=0` in the config file.
 
@@ -88,11 +88,14 @@ Sync backups on the destination are **not** auto-pruned (`cloudsync clean backup
 
 | What | Where |
 | --- | --- |
+| Installed command | `~/.local/bin/cloudsync` (copy; refresh with `./cloudsync setup` from the clone) |
+| rclone (FDA target) | `~/.local/bin/rclone` (`cloudsync setup --upgrade` to refresh) |
 | Job map | `~/.config/cloudsync/jobs.tsv` |
 | Optional overrides | `~/.config/cloudsync/config` (sourced as bash) |
 | Logs | `~/Library/Logs/cloudsync/` |
 | State / locks | `~/.local/state/cloudsync/` |
 | Sync backups | `<dest>/.cloudsync-backups/<job>/<timestamp>/` |
+| Bisync listings | `~/Library/Caches/rclone/bisync/` |
 
 Scheduled runs use a LaunchAgent whose PATH includes `~/.local/bin`, so they find the rclone that `setup` installed. Terminal often already has Full Disk Access; launchd does not inherit it — grant FDA to **`~/.local/bin/rclone`**, then `cloudsync schedule kick` and `cloudsync status` to confirm.
 
