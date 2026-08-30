@@ -61,12 +61,12 @@ NOTIFY=auto               # macOS notification on failure/abort: auto (non-inter
 # Load user overrides if present
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
-# User-writable bin (make setup / cloudsync setup). Prepend so a just-installed
-# rclone is found even if the parent shell has not updated PATH yet.
+# User-writable bin (make setup / cloudsync setup). Always prepend so the
+# FDA-stable rclone at $USER_BIN/rclone wins over Homebrew.
 USER_BIN="${CLOUDSYNC_BINDIR:-$HOME/.local/bin}"
-_user_bin_on_path=0
-case ":$PATH:" in *":$USER_BIN:"*) _user_bin_on_path=1 ;; esac
-[ "$_user_bin_on_path" = 1 ] || PATH="$USER_BIN:$PATH"
+_user_bin_first=0
+case ":$PATH:" in ":$USER_BIN:"*) _user_bin_first=1 ;; esac
+PATH="$USER_BIN:$PATH"
 
 mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$STATE_DIR" "$LOCK_DIR" 2>/dev/null
 
@@ -114,12 +114,24 @@ _install_self() {
   ok "cloudsync: $dest -> $src"
 }
 
-# Official zip into $1/rclone. No Homebrew, no sudo. Skip if rclone is already on PATH.
+_rclone_ver() {
+  local bin="$1" line
+  [ -x "$bin" ] || return 1
+  line="$("$bin" version 2>/dev/null | head -1)"
+  [ -n "$line" ] || return 1
+  printf '%s\n' "$line"
+}
+
+# Official zip into $1/rclone. $2=1 re-fetches. Skip only if *that* file works
+# (a Homebrew rclone on PATH is not the Full Disk Access target).
 _install_rclone() {
-  local bindir="$1" arch url tmp src_bin
-  if command -v rclone >/dev/null 2>&1; then
-    ok "rclone: $(command -v rclone)"
+  local bindir="$1" upgrade="${2:-0}" dest="$1/rclone" arch url tmp src_bin ver
+  if [ "$upgrade" != 1 ] && ver="$(_rclone_ver "$dest")"; then
+    ok "rclone: $dest ($ver)"
     return 0
+  fi
+  if [ "$upgrade" != 1 ] && [ -e "$dest" ]; then
+    info "existing $dest is not runnable; re-downloading"
   fi
   case "$(uname -m)" in
     arm64|aarch64) arch=arm64 ;;
@@ -152,11 +164,12 @@ _install_rclone() {
     return 1
   fi
   mkdir -p "$bindir" || { rm -rf "$tmp"; return 1; }
-  cp "$src_bin" "$bindir/rclone" || { rm -rf "$tmp"; return 1; }
-  chmod 755 "$bindir/rclone"
-  xattr -d com.apple.quarantine "$bindir/rclone" 2>/dev/null || true
+  cp "$src_bin" "$dest" || { rm -rf "$tmp"; return 1; }
+  chmod 755 "$dest"
+  xattr -d com.apple.quarantine "$dest" 2>/dev/null || true
   rm -rf "$tmp"
-  ok "rclone: $bindir/rclone"
+  ver="$(_rclone_ver "$dest")" || { err "rclone at $dest failed 'rclone version'"; return 1; }
+  ok "rclone: $dest ($ver)"
 }
 
 _seed_config() {
@@ -191,15 +204,25 @@ _seed_config() {
 }
 
 # First-run bootstrap: link this script, fetch rclone, seed config. No Homebrew.
+# --upgrade re-fetches $USER_BIN/rclone even if that file already works.
 cmd_setup() {
+  local upgrade=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --upgrade|-u) upgrade=1 ;;
+      -*) err "setup: unknown flag '$1' (use --upgrade)"; return 1 ;;
+      *)  err "setup: unexpected arg '$1'"; return 1 ;;
+    esac
+    shift
+  done
   [ "$(uname -s)" = Darwin ] || { err "cloudsync setup is for macOS"; return 1; }
   mkdir -p "$USER_BIN" "$CONFIG_DIR" || return 1
   _install_self || return 1
-  _install_rclone "$USER_BIN" || return 1
+  _install_rclone "$USER_BIN" "$upgrade" || return 1
   _seed_config || return 1
   echo
-  if [ "$_user_bin_on_path" != 1 ]; then
-    info "Add $USER_BIN to PATH (e.g. in ~/.zprofile):"
+  if [ "$_user_bin_first" != 1 ]; then
+    info "Put $USER_BIN first on PATH (e.g. in ~/.zprofile) so Terminal uses this rclone:"
     info "  export PATH=\"$USER_BIN:\$PATH\""
     info "then:  hash -r   (or open a new terminal)"
     echo
@@ -207,8 +230,8 @@ cmd_setup() {
   ok "Setup complete. Next:"
   info "  1. rclone config"
   info "     (add NextCloud/Filen/OneDrive remotes; skip if you only use iCloud)"
-  info "  2. Grant Full Disk Access to: $(command -v rclone 2>/dev/null || printf '%s' "$USER_BIN/rclone")"
-  info "     System Settings → Privacy & Security → Full Disk Access"
+  info "  2. Grant Full Disk Access to: $USER_BIN/rclone"
+  info "     (this exact file — not Homebrew). System Settings → Privacy & Security → Full Disk Access"
   info "  3. cloudsync edit            # then:  cloudsync dry <job|all>"
 }
 
@@ -686,16 +709,24 @@ cmd_doctor() {
     err "              missing — cloudsync setup seeds a template, or: cloudsync edit"
   fi
   printf '  iCloud    : %s\n' "$ICLOUD_ROOT"
-  if ! command -v rclone >/dev/null 2>&1; then
+  local rclone_bin
+  rclone_bin="$(command -v rclone 2>/dev/null || true)"
+  if [ -z "$rclone_bin" ]; then
     err "rclone is required. Run: cloudsync setup"
     return 1
+  fi
+  if [ "$rclone_bin" = "$USER_BIN/rclone" ]; then
+    ok "              FDA-stable copy ($(_rclone_ver "$rclone_bin" || printf 'unreadable'))"
+  else
+    err "              not $USER_BIN/rclone — Homebrew/other copies lose Full Disk Access on upgrade."
+    err "              Run: cloudsync setup    (grant FDA to that new file)"
   fi
   local out
   out="$(rclone lsf --dirs-only "$ICLOUD_ROOT" 2>&1)"
   if printf '%s' "$out" | grep -qiE 'permission denied|operation not permitted|not permitted|error'; then
     err "              NOT readable here — $(printf '%s' "$out" | head -1)"
     err "              => this context lacks Full Disk Access (fine for Terminal; required for launchd)."
-    err "              Grant FDA to rclone in System Settings → Privacy & Security → Full Disk Access."
+    err "              Grant FDA to $USER_BIN/rclone in System Settings → Privacy & Security → Full Disk Access."
   else
     ok "              readable ($(printf '%s\n' "$out" | grep -c .) top-level folders)"
   fi
@@ -947,7 +978,8 @@ usage() {
 cloudsync — rclone sync orchestrator (iCloud / NextCloud / Filen / OneDrive)
 
 USAGE
-  cloudsync setup                       first run: rclone + ~/.local/bin (no Homebrew)
+  cloudsync setup [--upgrade]           first run: rclone + ~/.local/bin (no Homebrew)
+                                        --upgrade re-fetches ~/.local/bin/rclone
   cloudsync                             menu (fzf) or a job list if fzf is missing
 
  Sync:
@@ -995,7 +1027,7 @@ EOF
 main() {
   local cmd="${1:-menu}"; shift 2>/dev/null || true
   case "$cmd" in
-    setup)     cmd_setup ;;
+    setup)     cmd_setup "$@" ;;
     menu|"")   cmd_menu ;;
     list|ls)   cmd_list "$@" ;;
     dry)       [ $# -ge 1 ] || { err "dry <job|all>"; exit 1; }; run_set "$1" 1 ;;
