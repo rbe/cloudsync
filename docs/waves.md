@@ -2,7 +2,7 @@
 
 cloudsync ships as a stock-macOS script. Each wave is a slice that can run in production; later waves do not rewrite earlier ones.
 
-**Now shipping: Wave 1.**
+**Now shipping: Wave 2.**
 
 ## Wave 1 — FDA-stable rclone
 
@@ -18,9 +18,9 @@ Grant Full Disk Access to **`~/.local/bin/rclone`**, not a Homebrew shim. Zip ch
 
 ## Wave 2 — Install by copy
 
-`~/.local/bin/cloudsync` is a symlink into the git clone. Moving or deleting the repo breaks launchd.
+`~/.local/bin/cloudsync` used to be a symlink into the git clone. Moving or deleting the repo broke launchd.
 
-Copy the script on setup; a later `setup` refreshes the copy. The clone is no longer load-bearing.
+`cloudsync setup` copies the script to `~/.local/bin/cloudsync` (replacing a leftover symlink). Run setup **from the clone** (or `make setup`) to refresh that copy. The installed command does not depend on the repo. Config stays in `~/.config/cloudsync/`.
 
 ## Wave 3 — Doctor walks the job map
 
