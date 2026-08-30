@@ -6,11 +6,11 @@
 #        sync   = make dest mirror source, DELETES extras      (kept in .cloudsync-backups/)
 #        bisync = two-way; run `cloudsync resync <name>` once before first `run`
 #
-# paths: iCloudDocs/<sub> = iCloud Drive files | iCloudAll/<sub> = all iCloud app containers | Remote:path = rclone remote
+# paths: iCloudDocs/<sub> = iCloud Drive files | iCloudAll/<sub> = all iCloud app containers | Name:path = rclone remote (replace Remote: in the examples)
 # extra: any rclone flags, e.g. --filter-from <file>, --exclude '*.tmp', or @prefetch (materialize iCloud stubs)
 #
 # IMPORTANT: columns are separated by a single TAB, not spaces. `cloudsync edit` opens this file.
-# The lines below are EXAMPLES — uncomment and edit paths, then `cloudsync dry <name>`.
+# `cloudsync doctor` checks remotes and bisync baselines. Uncomment an example, set real remotes, then `cloudsync dry <name>`.
 
 #name	mode	source	dest	extra
 #icloud-to-nx	sync	iCloudAll	Remote:backup/iCloud	@prefetch --filter-from ~/.config/cloudsync/icloud.filter
