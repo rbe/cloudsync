@@ -1,8 +1,8 @@
 # cloudsync — thin wrapper around `cloudsync setup`
 #
-#   make setup      link ~/.local/bin, install rclone there (no Homebrew), seed config
+#   make setup      copy cloudsync + rclone into ~/.local/bin, seed config
 #   make upgrade    re-fetch ~/.local/bin/rclone
-#   make uninstall  remove the cloudsync symlink (rclone and config stay)
+#   make uninstall  remove the installed cloudsync (rclone and config stay)
 #
 # GNU Make 3.81-compatible (stock macOS).
 
@@ -20,7 +20,7 @@ all: help
 help:
 	@echo "cloudsync  —  $(SRC)"
 	@echo
-	@echo "  make setup        $(SRC) setup   (rclone into $(BINDIR), no Homebrew)"
+	@echo "  make setup        $(SRC) setup   (copy script + rclone into $(BINDIR))"
 	@echo "  make upgrade      $(SRC) setup --upgrade   (re-fetch rclone)"
 	@echo "  make install      alias for setup"
 	@echo "  make check        syntax-check the script"
@@ -40,7 +40,7 @@ uninstall:
 	  rm -f "$(DEST)"; \
 	  echo "removed $(DEST)"; \
 	else \
-	  echo "no symlink at $(DEST)"; \
+	  echo "not installed at $(DEST)"; \
 	fi
 	@echo "Config, logs, launchd agent, and rclone were left in place."
 	@echo "Remove the schedule with:  cloudsync schedule uninstall"
