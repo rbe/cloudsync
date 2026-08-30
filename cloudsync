@@ -10,10 +10,10 @@ set -u
 set -o pipefail
 
 # ---------------------------------------------------------------------------
-# Locate the project dir = the directory of this script, resolved through any
-# symlink (e.g. ~/bin/cloudsync -> ~/project/ralfssync/cloudsync). Used for the
-# scheduled (launchd) program path. The script itself lives in the project;
-# config/logs/state follow OS conventions (see below).
+# Locate the directory of this script, resolved through any leftover symlink.
+# Running from a git clone, that directory holds examples/. After setup, the
+# installed command is a copy in ~/.local/bin (the clone is not load-bearing).
+# Config/logs/state follow OS conventions (see below).
 # ---------------------------------------------------------------------------
 _src="${BASH_SOURCE[0]}"
 while [ -h "$_src" ]; do
@@ -103,15 +103,30 @@ _seed_file() {
   return 1
 }
 
+# Copy this script to $USER_BIN/cloudsync. Replaces a Wave 1 symlink. Running
+# setup from a clone refreshes the copy; running the copy is a no-op.
 _install_self() {
   local dest="$USER_BIN/cloudsync" src="$PROJECT_DIR/cloudsync"
   mkdir -p "$USER_BIN" || return 1
-  if [ -e "$dest" ] && [ "$src" -ef "$dest" ]; then
+  if [ ! -f "$src" ]; then
+    err "cloudsync script not found: $src"
+    return 1
+  fi
+  if [ -d "$dest" ]; then
+    err "refusing to overwrite directory $dest"
+    return 1
+  fi
+  if [ -L "$dest" ]; then
+    info "replacing symlink $dest with a copy"
+    rm -f "$dest" || return 1
+  elif [ -e "$dest" ] && [ "$src" -ef "$dest" ]; then
     ok "cloudsync: $dest"
     return 0
   fi
-  ln -sfn "$src" "$dest" || return 1
-  ok "cloudsync: $dest -> $src"
+  cp "$src" "$dest" || return 1
+  chmod 755 "$dest"
+  xattr -d com.apple.quarantine "$dest" 2>/dev/null || true
+  ok "cloudsync: $dest"
 }
 
 _rclone_ver() {
@@ -203,7 +218,7 @@ _seed_config() {
   fi
 }
 
-# First-run bootstrap: link this script, fetch rclone, seed config. No Homebrew.
+# First-run bootstrap: copy this script, fetch rclone, seed config. No Homebrew.
 # --upgrade re-fetches $USER_BIN/rclone even if that file already works.
 cmd_setup() {
   local upgrade=0
@@ -701,6 +716,12 @@ cmd_doctor() {
   printf '  cloudsync : %s\n' "$(command -v cloudsync || echo "NOT ON PATH (cloudsync setup → $USER_BIN)")"
   printf '  script    : %s\n' "$PROJECT_DIR/cloudsync"
   printf '  launchd   : %s\n' "$(program_path)"
+  local inst="${CLOUDSYNC_BIN:-$USER_BIN/cloudsync}"
+  if [ -L "$inst" ]; then
+    err "              symlink into the git clone — launchd breaks if the clone moves. Run: cloudsync setup"
+  elif [ -f "$inst" ]; then
+    ok "              installed copy (clone is not load-bearing)"
+  fi
   printf '  bash      : %s (%s)\n' "${BASH:-/bin/bash}" "${BASH_VERSION:-unknown}"
   printf '  rclone    : %s\n' "$(command -v rclone || echo "MISSING (cloudsync setup)")"
   printf '  fzf       : %s\n' "$(command -v fzf || echo "optional (interactive menu)")"
@@ -978,7 +999,7 @@ usage() {
 cloudsync — rclone sync orchestrator (iCloud / NextCloud / Filen / OneDrive)
 
 USAGE
-  cloudsync setup [--upgrade]           first run: rclone + ~/.local/bin (no Homebrew)
+  cloudsync setup [--upgrade]           copy this script + rclone into ~/.local/bin
                                         --upgrade re-fetches ~/.local/bin/rclone
   cloudsync                             menu (fzf) or a job list if fzf is missing
 
