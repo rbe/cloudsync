@@ -2,7 +2,7 @@
 
 cloudsync ships as a stock-macOS script. Each wave is a slice that can run in production; later waves do not rewrite earlier ones.
 
-**Now shipping: Wave 2.**
+**Now shipping: Wave 3.**
 
 ## Wave 1 — FDA-stable rclone
 
@@ -24,9 +24,7 @@ Grant Full Disk Access to **`~/.local/bin/rclone`**, not a Homebrew shim. Zip ch
 
 ## Wave 3 — Doctor walks the job map
 
-`doctor` today checks iCloud in *this* process and lists every rclone remote.
-
-Walk `jobs.tsv`: unknown mode, dest remote missing from `rclone listremotes`, bisync job with no baseline.
+`cloudsync doctor` walks every active row in `jobs.tsv`: unknown mode, placeholder `Remote:`, dest/source remote missing from `rclone listremotes`, bisync job with no listing files in the rclone workdir (`~/Library/Caches/rclone/bisync` on macOS). Fix: `rclone config` or `cloudsync resync <job>`.
 
 ## Wave 4 — Validate the job map
 
