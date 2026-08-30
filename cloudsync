@@ -385,6 +385,72 @@ load_job() {
   return 1
 }
 
+# True if the jobs.tsv line is blank or a comment (optional leading space, then #).
+_jobs_skip_line() {
+  case "$1" in ''|'#'*) return 0 ;; esac
+  printf '%s' "$1" | grep -qE '^[[:space:]]*(#|$)' 
+}
+
+_is_placeholder_remote() {
+  local resolved n
+  resolved="$(resolve_path "$1")"
+  is_remote "$resolved" || return 1
+  n="${resolved%%:*}"
+  case "$n" in Remote|remote) return 0 ;; *) return 1 ;; esac
+}
+
+# Structural check of jobs.tsv (no rclone). Rejects space-separated rows, unknown
+# modes, missing columns, and the placeholder remote Remote:.
+validate_jobs_file() {
+  local line lineno=0 name mode src dst extra rc=0
+  [ -f "$JOBS_FILE" ] || { err "No job map: $JOBS_FILE"; return 1; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno+1))
+    _jobs_skip_line "$line" && continue
+    case "$line" in
+      *$'\t'*) ;;
+      *)
+        err "$JOBS_FILE:$lineno: no TAB — columns must be tab-separated, not spaces"
+        rc=1
+        continue ;;
+    esac
+    name=""; mode=""; src=""; dst=""; extra=""
+    IFS=$'\t' read -r name mode src dst extra <<EOF
+$line
+EOF
+    if [ -z "$name" ] || [ -z "$mode" ] || [ -z "$src" ] || [ -z "$dst" ]; then
+      err "$JOBS_FILE:$lineno: need name, mode, source, dest"
+      rc=1
+      continue
+    fi
+    case "$mode" in
+      copy|sync|bisync) ;;
+      *) err "$JOBS_FILE:$lineno: unknown mode '$mode' (use copy|sync|bisync)"; rc=1 ;;
+    esac
+    if _is_placeholder_remote "$src" || _is_placeholder_remote "$dst"; then
+      err "$JOBS_FILE:$lineno: placeholder remote 'Remote:' — set a real rclone remote"
+      rc=1
+    fi
+  done < "$JOBS_FILE"
+  return $rc
+}
+
+cmd_edit() {
+  mkdir -p "$CONFIG_DIR" || return 1
+  if [ ! -f "$JOBS_FILE" ]; then
+    err "No job map yet: $JOBS_FILE"
+    err "Run: cloudsync setup"
+    return 1
+  fi
+  "${EDITOR:-vi}" "$JOBS_FILE" || return 1
+  if validate_jobs_file; then
+    ok "job map OK"
+    return 0
+  fi
+  err "job map has errors — fix with: cloudsync edit"
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # Pre-flight safety gate (sync/bisync, real runs only)
 # ---------------------------------------------------------------------------
@@ -443,6 +509,7 @@ preflight_guard() {
 # Lock wrapper around _do_job so a scheduled run can't collide with a manual one.
 run_job() {
   local name="$1" dry="${2:-0}" resync="${3:-0}"
+  validate_jobs_file || return 1
   local lock="$LOCK_DIR/$name.lock"
   if ! mkdir "$lock" 2>/dev/null; then
     # Lock exists — is the owning process still alive? If not, it's stale
@@ -475,6 +542,21 @@ _do_job() {
   dst="$(resolve_path "$J_DST")"
 
   parse_extra "$J_EXTRA"
+
+  if [ "$J_MODE" = bisync ] && [ "$resync" != 1 ]; then
+    local bstat
+    _bisync_baseline_stat "$src" "$dst"
+    bstat=$?
+    if [ "$bstat" -ne 0 ]; then
+      if [ "$bstat" -eq 2 ]; then
+        err "[$name] bisync listings in error state. Run: cloudsync resync $name"
+      else
+        err "[$name] no bisync baseline. Run: cloudsync resync $name  (required before the first run)"
+      fi
+      [ "$dry" = 0 ] && record_status "$name" 1 $((SECONDS-start)) aborted "no bisync baseline"
+      return 1
+    fi
+  fi
 
   local log="$LOG_DIR/$name-$(TS).log"
 
@@ -564,6 +646,7 @@ _do_job() {
 run_set() {
   # $1 = job name or 'all'  ; $2 = dryrun(0/1)
   local target="$1" dry="$2" rc=0 n
+  validate_jobs_file || return 1
   if [ "$target" = all ]; then
     for n in $(job_names); do run_job "$n" "$dry" 0 || rc=1; done
   else
@@ -785,6 +868,7 @@ _doctor_job() {
 _doctor_jobs() {
   local name mode src dst extra n=0 rc=0
   [ -f "$JOBS_FILE" ] || return 0
+  validate_jobs_file || rc=1
   while IFS=$'\t' read -r name mode src dst extra; do
     case "$name" in ''|\#*) continue ;; esac
     n=$((n+1))
@@ -1105,7 +1189,7 @@ USAGE
   cloudsync doctor                      check iCloud FDA, job remotes, bisync baselines
 
  Maintain:
-  cloudsync edit                        edit the job map (\$EDITOR)
+  cloudsync edit                        edit the job map (\$EDITOR), then validate TSV
   cloudsync clean  [logs] [--days N] [--dry-run]              prune logs / cap launchd logs / stale locks
   cloudsync clean  backups [--days N | --keep K] [--dry-run]  purge old destination backups
   cloudsync schedule install [manual|hourly|daily [HH:MM]|<seconds>]   set up the launchd agent
@@ -1126,7 +1210,9 @@ JOB MAP FORMAT  (tab-separated)
   name <TAB> mode <TAB> source <TAB> dest <TAB> [extra rclone flags]
   mode = copy (add-only) | sync (mirror, deletes) | bisync (two-way)
   Paths: 'iCloudDocs/...' = iCloud Drive files | 'iCloudAll/...' = all iCloud
-         app containers | 'Remote:path' = rclone remote.
+         app containers | 'Name:path' = rclone remote (not the placeholder Remote:).
+  Columns MUST be TAB-separated. 'cloudsync edit' and 'dry' reject space-separated rows.
+  Bisync: run 'cloudsync resync <name>' once before the first 'run'.
   Add '@prefetch' to extra to materialize dataless iCloud files first.
 EOF
 }
@@ -1153,7 +1239,7 @@ main() {
     resync)    [ $# -ge 1 ] || { err "resync <job>"; exit 1; }; run_job "$1" 0 1 ;;
     verify)    cmd_verify "$@" ;;
     status)    cmd_status ;;
-    edit)      "${EDITOR:-vi}" "$JOBS_FILE" ;;
+    edit)      cmd_edit ;;
     logs)      cmd_logs ;;
     doctor)    cmd_doctor ;;
     clean)     cmd_clean "$@" ;;
