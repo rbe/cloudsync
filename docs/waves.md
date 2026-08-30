@@ -2,7 +2,7 @@
 
 cloudsync ships as a stock-macOS script. Each wave is a slice that can run in production; later waves do not rewrite earlier ones.
 
-**Now shipping: Wave 3.**
+**Now shipping: Wave 4.**
 
 ## Wave 1 — FDA-stable rclone
 
@@ -28,7 +28,7 @@ Grant Full Disk Access to **`~/.local/bin/rclone`**, not a Homebrew shim. Zip ch
 
 ## Wave 4 — Validate the job map
 
-TAB-vs-spaces is the remaining config footgun. On `edit` / `dry`, reject a line that has no tab, warn on placeholder remotes like `Remote:`, and require `resync` before the first bisync `run`. Stay TSV; no YAML.
+TAB-vs-spaces is the remaining config footgun. `cloudsync edit`, `dry`, and `run` reject an active line that has no tab, an unknown mode, or the placeholder remote `Remote:`. A bisync `run` / `dry` without listing files aborts until `cloudsync resync <job>`. Stay TSV; no YAML.
 
 ## Not in scope
 
