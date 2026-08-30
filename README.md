@@ -15,12 +15,12 @@ From this directory:
 That will:
 
 - symlink `~/.local/bin/cloudsync` to this script
-- download rclone into `~/.local/bin` if it is not already on PATH
+- install rclone at `~/.local/bin/rclone` (even if Homebrew already has one — that copy is the Full Disk Access target; `cloudsync setup --upgrade` refreshes it)
 - seed `~/.config/cloudsync/` from `examples/` without overwriting files you already have
 
-`make setup` does the same thing.
+`make setup` does the same thing. Shipping plan: [docs/waves.md](docs/waves.md) (Wave 1 now).
 
-If `~/.local/bin` is not on your PATH, add this to `~/.zprofile` and open a new terminal:
+If `~/.local/bin` is not **first** on your PATH, add this to `~/.zprofile` and open a new terminal:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
@@ -29,9 +29,9 @@ export PATH="$HOME/.local/bin:$PATH"
 ### After setup
 
 1. **Remotes:** `rclone config` — add NextCloud / Filen / OneDrive. Skip this if every job is local or iCloud-only.
-2. **Full Disk Access:** grant it to the rclone binary printed by `cloudsync doctor`.  
+2. **Full Disk Access:** grant it to **`~/.local/bin/rclone`** (confirm with `cloudsync doctor`).  
    System Settings → Privacy & Security → Full Disk Access.  
-   Without this, iCloud looks empty and a `sync` job would try to wipe the destination; cloudsync aborts instead.
+   Without this, iCloud looks empty and a `sync` job would try to wipe the destination; cloudsync aborts instead. Homebrew rclone is the wrong target — FDA on that path breaks after `brew upgrade rclone`.
 3. **Jobs:** `cloudsync edit` — columns are **TAB**-separated. Uncomment an example and fix remote names and paths.
 4. **Preview:** `cloudsync dry <job|all>`
 5. **Run:** `cloudsync run <job|all>`
@@ -42,7 +42,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 | Command | Purpose |
 | --- | --- |
-| `setup` | rclone + `~/.local/bin` + seed config |
+| `setup [--upgrade]` | rclone at `~/.local/bin/rclone` (FDA target) + seed config |
 | `dry <job\|all>` | preview, no writes |
 | `run <job\|all> [--force]` | real run (`--force` skips the safety gate) |
 | `resync <job>` | first-time bisync baseline |
@@ -93,7 +93,7 @@ Sync backups on the destination are **not** auto-pruned (`cloudsync clean backup
 | State / locks | `~/.local/state/cloudsync/` |
 | Sync backups | `<dest>/.cloudsync-backups/<job>/<timestamp>/` |
 
-Scheduled runs use a LaunchAgent whose PATH includes `~/.local/bin`, so they find the rclone that `setup` installed. Terminal often already has Full Disk Access; launchd does not inherit it — grant FDA to **rclone**, then `cloudsync schedule kick` and `cloudsync status` to confirm.
+Scheduled runs use a LaunchAgent whose PATH includes `~/.local/bin`, so they find the rclone that `setup` installed. Terminal often already has Full Disk Access; launchd does not inherit it — grant FDA to **`~/.local/bin/rclone`**, then `cloudsync schedule kick` and `cloudsync status` to confirm.
 
 ## License
 
