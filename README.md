@@ -14,11 +14,11 @@ From this directory:
 
 That will:
 
-- symlink `~/.local/bin/cloudsync` to this script
+- copy this script to `~/.local/bin/cloudsync` (not a symlink; the git clone is not load-bearing)
 - install rclone at `~/.local/bin/rclone` (even if Homebrew already has one — that copy is the Full Disk Access target; `cloudsync setup --upgrade` refreshes it)
 - seed `~/.config/cloudsync/` from `examples/` without overwriting files you already have
 
-`make setup` does the same thing. Shipping plan: [docs/waves.md](docs/waves.md) (Wave 1 now).
+`make setup` does the same thing. Shipping plan: [docs/waves.md](docs/waves.md) (Wave 2 now).
 
 If `~/.local/bin` is not **first** on your PATH, add this to `~/.zprofile` and open a new terminal:
 
@@ -42,7 +42,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 | Command | Purpose |
 | --- | --- |
-| `setup [--upgrade]` | rclone at `~/.local/bin/rclone` (FDA target) + seed config |
+| `setup [--upgrade]` | copy this script + rclone into `~/.local/bin`; seed config |
 | `dry <job\|all>` | preview, no writes |
 | `run <job\|all> [--force]` | real run (`--force` skips the safety gate) |
 | `resync <job>` | first-time bisync baseline |
