@@ -708,10 +708,100 @@ cmd_logs() {
   info "Tailing $latest (Ctrl-C to stop)"; tail -f "$latest"
 }
 
+# rclone bisync listings (macOS: ~/Library/Caches/rclone/bisync).
+_bisync_workdir() {
+  case "$(uname -s)" in
+    Darwin) printf '%s/Library/Caches/rclone/bisync' "$HOME" ;;
+    *)      printf '%s/rclone/bisync' "${XDG_CACHE_HOME:-$HOME/.cache}" ;;
+  esac
+}
+
+# Approximate rclone CanonicalPath: trim slashes, replace [\s\/:*?] with _.
+_bisync_canon() {
+  printf '%s' "$1" | sed -E 's#^[\\/]+##; s#[\\/]+$##; s#[\\/:*?[:space:]]#_#g'
+}
+
+# 0 = both .path1.lst and .path2.lst exist; 2 = .lst-err; 1 = missing.
+_bisync_baseline_stat() {
+  local src="$1" dst="$2" wd base
+  wd="$(_bisync_workdir)"
+  base="$wd/$(_bisync_canon "$src")..$(_bisync_canon "$dst")"
+  if [ -f "$base.path1.lst" ] && [ -f "$base.path2.lst" ]; then return 0; fi
+  if [ -f "$base.path1.lst-err" ] || [ -f "$base.path2.lst-err" ]; then return 2; fi
+  return 1
+}
+
+_remote_listed() {
+  rclone listremotes 2>/dev/null | grep -Fxq "${1}:"
+}
+
+# Check one jobs.tsv row. $1=name $2=mode $3=src $4=dst
+_doctor_job() {
+  local name="$1" mode="$2" src="$3" dst="$4"
+  local rsrc rdst side rname rc=0 bstat
+  printf '  job       %s  (%s)  %s -> %s\n' "$name" "$mode" "$src" "$dst"
+  case "$mode" in
+    copy|sync|bisync) ;;
+    *) err "              unknown mode '$mode' (use copy|sync|bisync)"; return 1 ;;
+  esac
+  if [ -z "$src" ] || [ -z "$dst" ]; then
+    err "              missing source or dest column"
+    return 1
+  fi
+  rsrc="$(resolve_path "$src")"
+  rdst="$(resolve_path "$dst")"
+  for side in "$rsrc" "$rdst"; do
+    is_remote "$side" || continue
+    rname="${side%%:*}"
+    case "$rname" in
+      Remote|remote)
+        err "              placeholder remote '$rname:' — edit the job map"
+        rc=1
+        continue ;;
+    esac
+    if _remote_listed "$rname"; then
+      ok "              remote ${rname}: configured"
+    else
+      err "              remote ${rname}: not in rclone config. Run: rclone config"
+      rc=1
+    fi
+  done
+  if [ "$mode" = bisync ]; then
+    _bisync_baseline_stat "$rsrc" "$rdst"
+    bstat=$?
+    if [ "$bstat" -eq 0 ]; then
+      ok "              bisync baseline present"
+    elif [ "$bstat" -eq 2 ]; then
+      err "              bisync listings in error state (.lst-err). Run: cloudsync resync $name"
+      rc=1
+    else
+      err "              no bisync baseline. Run: cloudsync resync $name"
+      rc=1
+    fi
+  fi
+  return $rc
+}
+
+_doctor_jobs() {
+  local name mode src dst extra n=0 rc=0
+  [ -f "$JOBS_FILE" ] || return 0
+  while IFS=$'\t' read -r name mode src dst extra; do
+    case "$name" in ''|\#*) continue ;; esac
+    n=$((n+1))
+    _doctor_job "$name" "$mode" "$src" "$dst" || rc=1
+  done < "$JOBS_FILE"
+  if [ "$n" -eq 0 ]; then
+    info "  jobs      none active (uncomment a line in the job map)"
+  fi
+  return $rc
+}
+
 # Read-only health probe. The iCloud check is the important one: it must pass in
 # the SAME context that will run the sync (e.g. launchd), which needs Full Disk
 # Access. Run via 'schedule kick' against a probe to test the launchd context.
+# Wave 3: also walk jobs.tsv (mode, remotes, bisync baseline).
 cmd_doctor() {
+  local rc=0
   info "cloudsync doctor"
   printf '  cloudsync : %s\n' "$(command -v cloudsync || echo "NOT ON PATH (cloudsync setup → $USER_BIN)")"
   printf '  script    : %s\n' "$PROJECT_DIR/cloudsync"
@@ -751,11 +841,8 @@ cmd_doctor() {
   else
     ok "              readable ($(printf '%s\n' "$out" | grep -c .) top-level folders)"
   fi
-  while IFS= read -r r; do
-    [ -n "$r" ] || continue
-    if rclone lsd "$r" --max-depth 1 >/dev/null 2>&1; then ok "  remote    $r reachable"
-    else err "  remote    $r NOT reachable"; fi
-  done < <(rclone listremotes 2>/dev/null)
+  _doctor_jobs || rc=1
+  return $rc
 }
 
 # List the iCloud containers under "Mobile Documents" so you can see everything
@@ -1015,7 +1102,7 @@ USAGE
   cloudsync list   backups              backup-dir snapshots living on the destinations
   cloudsync list   icloud-apps          iCloud app containers (the full Finder 'iCloud Drive' view)
   cloudsync logs                        tail the most recent run log
-  cloudsync doctor                      check iCloud Full Disk Access + remote reachability
+  cloudsync doctor                      check iCloud FDA, job remotes, bisync baselines
 
  Maintain:
   cloudsync edit                        edit the job map (\$EDITOR)
