@@ -18,7 +18,7 @@ That will:
 - install rclone at `~/.local/bin/rclone` (even if Homebrew already has one — that copy is the Full Disk Access target; `cloudsync setup --upgrade` refreshes it)
 - seed `~/.config/cloudsync/` from `examples/` without overwriting files you already have
 
-`make setup` does the same thing. Shipping plan: [docs/waves.md](docs/waves.md) (Wave 3 now).
+`make setup` does the same thing.
 
 If `~/.local/bin` is not **first** on your PATH, add this to `~/.zprofile` and open a new terminal:
 
@@ -32,11 +32,12 @@ export PATH="$HOME/.local/bin:$PATH"
 2. **Full Disk Access:** grant it to **`~/.local/bin/rclone`** (confirm with `cloudsync doctor`).  
    System Settings → Privacy & Security → Full Disk Access.  
    Without this, iCloud looks empty and a `sync` job would try to wipe the destination; cloudsync aborts instead. Homebrew rclone is the wrong target — FDA on that path breaks after `brew upgrade rclone`.
-3. **Jobs:** `cloudsync edit` — columns are **TAB**-separated. Uncomment an example and fix remote names and paths.
-4. **Preview:** `cloudsync dry <job|all>`
-5. **Run:** `cloudsync run <job|all>`
+3. **Jobs:** `cloudsync edit` — columns are **TAB**-separated (spaces will not parse). Uncomment an example and fix remote names and paths.
+4. **Check:** `cloudsync doctor` — Full Disk Access, remotes used by jobs, bisync baselines.
+5. **Preview:** `cloudsync dry <job|all>`
+6. **Run:** `cloudsync run <job|all>`
 
-`cloudsync help` lists every command.
+`cloudsync help` lists every command. Shipping plan: [docs/waves.md](docs/waves.md) (Wave 3 now).
 
 ## Commands
 
@@ -72,7 +73,7 @@ Paths:
 
 - `iCloudDocs/…` — iCloud Drive files (`com~apple~CloudDocs` only)
 - `iCloudAll/…` — whole `Mobile Documents` tree (Finder's merged iCloud Drive)
-- `Remote:path` — rclone remote
+- `Nx:path` / `Filen:path` — rclone remote (`rclone listremotes`); not the placeholder `Remote:`
 - `~/…` or `/abs` — local
 
 In extra flags, `@prefetch` runs `brctl download` so dataless iCloud files become real bytes. A leading `~/` on a flag argument is expanded (rclone will not). See `examples/jobs.tsv` and `examples/icloud.filter`.
