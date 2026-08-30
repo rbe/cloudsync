@@ -2,6 +2,9 @@
 # Uncomment and edit any line to override the built-in default.
 # This file is optional; deleting it restores defaults.
 
+# rclone is the copy at ~/.local/bin/rclone (cloudsync setup). Grant Full Disk Access
+# to that file, not a Homebrew rclone. Refresh with: cloudsync setup --upgrade
+
 # --- rclone tuning -----------------------------------------------------------
 #TRANSFERS=6                 # parallel file transfers
 #CHECKERS=12                 # parallel checkers (hash/size compares)
