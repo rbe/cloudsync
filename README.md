@@ -4,6 +4,27 @@ macOS orchestrator for [rclone](https://rclone.org) jobs between iCloud, NextClo
 
 iCloud is read from local paths under `~/Library/Mobile Documents`, not rclone's `iclouddrive` backend. Stock `/bin/bash` 3.2 is enough — Homebrew is not required.
 
+**TL;DR.** Write a tab-separated job map. Each row is one rclone job (copy, sync, or bisync). `cloudsync setup` copies this script and a stable rclone into `~/.local/bin`. Grant Full Disk Access to **that** rclone, then `cloudsync dry` / `run`. iCloud is a folder on disk; other clouds are rclone remotes.
+
+## How it works
+
+One job is one line in `~/.config/cloudsync/jobs.tsv` (tabs, not spaces):
+
+```
+photos	sync	iCloudDocs/Photos	Nx:Photos	@prefetch
+```
+
+That means: make NextCloud `Nx:Photos` match the Photos folder in iCloud Drive. `sync` mirrors (deletes extras on dest, keeping them under `.cloudsync-backups/`). `copy` only adds. `bisync` is two-way after a one-time `cloudsync resync photos`.
+
+`cloudsync run photos` then:
+
+1. Resolves `iCloudDocs/…` to `~/Library/Mobile Documents/com~apple~CloudDocs/…`. `Nx:Photos` is whatever `rclone config` named `Nx`.
+2. `@prefetch` runs `brctl download` so dataless iCloud stubs become real bytes rclone can read.
+3. Lists both sides. Aborts if the source looks empty (usual Full Disk Access miss) or a `sync` would delete more than `MAX_DELETE` files.
+4. Runs rclone. Writes a log under `~/Library/Logs/cloudsync/`.
+
+`cloudsync dry photos` is the same without writes. `cloudsync schedule install hourly` is the same on a timer (launchd does not inherit Terminal's Full Disk Access — grant it to `~/.local/bin/rclone`).
+
 ## Quick start
 
 From this directory:
